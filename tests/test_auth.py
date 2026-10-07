@@ -5075,7 +5075,8 @@ def test_mcp_server_name_parser_prefers_path_param_over_query_or_body(
     )
 
 
-def test_mcp_server_path_rules_use_mcpservers_resource():
+@pytest.mark.parametrize("prefix", ["/api/3.0", "/ajax-api/3.0"])
+def test_mcp_server_path_rules_use_mcpservers_resource(prefix):
     if not HAS_MCP_REGISTRY:
         pytest.skip("Installed MLflow version does not expose the MCP registry routes.")
 
@@ -5153,25 +5154,28 @@ def test_mcp_server_path_rules_use_mcpservers_resource():
     ]
 
     for route, expected_verb, expected_parsers, expected_policy in cases:
-        rule = PATH_AUTHORIZATION_RULES[route]
+        path, method = route
+        rule = PATH_AUTHORIZATION_RULES[(path.replace("/api/3.0", prefix, 1), method)]
         assert isinstance(rule, AuthorizationRule)
         assert (rule.verb, rule.resource) == (expected_verb, RESOURCE_MCP_SERVERS)
         assert rule.resource_name_parsers == expected_parsers
         assert rule.collection_policy == expected_policy
 
 
-def test_find_authorization_rules_prefers_nested_mcp_routes():
+@pytest.mark.parametrize("prefix", ["/api/3.0", "/ajax-api/3.0"])
+@pytest.mark.parametrize(("method", "expected_verb"), [("GET", "get"), ("DELETE", "update")])
+def test_find_authorization_rules_prefers_nested_mcp_routes(prefix, method, expected_verb):
     if not HAS_MCP_REGISTRY:
         pytest.skip("Installed MLflow version does not expose the MCP registry routes.")
 
     rules = _find_authorization_rules(
-        "/api/3.0/mlflow/mcp-servers/com.test/demo-server/versions/1.0.0",
-        "GET",
+        f"{prefix}/mlflow/mcp-servers/com.test/demo-server/versions/1.0.0",
+        method,
     )
 
     assert rules is not None
     assert len(rules) == 1
-    assert rules[0].verb == "get"
+    assert rules[0].verb == expected_verb
     assert rules[0].resource == RESOURCE_MCP_SERVERS
     assert rules[0].resource_name_parsers == (RESOURCE_NAME_PARSER_MCP_SERVER_NAME,)
 
