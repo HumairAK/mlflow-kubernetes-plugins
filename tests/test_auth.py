@@ -70,6 +70,8 @@ from mlflow_kubernetes_plugins.auth._compat import (
     HAS_MLFLOW_3_13_AUTH_SURFACE,
     HAS_MLFLOW_3_14_AUTH_SURFACE,
     HAS_MLFLOW_3_15_AUTH_SURFACE,
+    HAS_MLFLOW_3_16_AUTH_SURFACE,
+    HAS_MLFLOW_3_17_AUTH_SURFACE,
     AddGuardrailToEndpoint,
     AddItemsToReviewQueue,
     BatchGetTraceInfos,
@@ -119,6 +121,7 @@ from mlflow_kubernetes_plugins.auth.authorizer import (
     _CacheEntry,
 )
 from mlflow_kubernetes_plugins.auth.collection_filters import (
+    COLLECTION_POLICY_BROAD_ONLY,
     COLLECTION_POLICY_REQUEST_EXPERIMENT_ID,
     COLLECTION_POLICY_REQUEST_EXPERIMENT_IDS,
     COLLECTION_POLICY_REQUEST_RUN_IDS,
@@ -339,6 +342,19 @@ def test_canonicalize_path_static_prefix_applies_to_supported_route_families(mon
     assert _canonicalize_path(raw_path=health_path) == "/health"
     assert _canonicalize_path(raw_path=metrics_path) == "/metrics"
     assert _canonicalize_path(raw_path=version_path) == "/version"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/gateway/mlflow/v1/models",
+        "/gateway/typesafe/v1/systemone",
+        "/v1/traces",
+    ],
+)
+def test_canonicalize_gateway_and_otel_paths_with_static_prefix(monkeypatch, path):
+    monkeypatch.setenv(STATIC_PREFIX_ENV_VAR, "/mlflow")
+    assert _canonicalize_path(raw_path=f"/mlflow{path}") == path
 
 
 @pytest.mark.parametrize(
@@ -3126,6 +3142,9 @@ def test_gateway_invocation_routes_require_use():
         ("/gateway/gemini/v1beta/models/<endpoint_name>:generateContent", "POST"),
         ("/gateway/gemini/v1beta/models/<endpoint_name>:streamGenerateContent", "POST"),
     ]
+    if HAS_MLFLOW_3_17_AUTH_SURFACE:
+        routes.append(("/gateway/typesafe/v1/systemone", "POST"))
+
     for route in routes:
         rule = PATH_AUTHORIZATION_RULES[route]
         assert (rule.verb, rule.resource, rule.subresource) == (
@@ -3401,6 +3420,97 @@ def test_mlflow_315_request_authorization_rules_cover_new_endpoints():
     ):
         assert PATH_AUTHORIZATION_RULES[(prefix, "GET")] == artifact_get_rule
         assert PATH_AUTHORIZATION_RULES[(prefix, "PUT")] == artifact_put_rule
+
+
+def test_mlflow_316_assistant_tool_result_authorization():
+    if not HAS_MLFLOW_3_16_AUTH_SURFACE:
+        pytest.skip("Installed MLflow version does not expose the 3.16 assistant route.")
+
+    assert PATH_AUTHORIZATION_RULES[
+        ("/ajax-api/3.0/mlflow/assistant/sessions/<session_id>/tool-result", "POST")
+    ] == AuthorizationRule("update", resource=RESOURCE_ASSISTANTS)
+
+
+def test_mlflow_317_gateway_authorization():
+    if not HAS_MLFLOW_3_17_AUTH_SURFACE:
+        pytest.skip("Installed MLflow version does not expose the 3.17 gateway routes.")
+
+    assert PATH_AUTHORIZATION_RULES[("/gateway/mlflow/v1/models", "GET")] == AuthorizationRule(
+        "list", resource=RESOURCE_GATEWAY_ENDPOINTS, collection_policy=COLLECTION_POLICY_BROAD_ONLY
+    )
+    assert PATH_AUTHORIZATION_RULES[
+        ("/gateway/typesafe/v1/systemone", "POST")
+    ] == AuthorizationRule(
+        "create",
+        resource=RESOURCE_GATEWAY_ENDPOINTS,
+        subresource="use",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_GATEWAY_PROXY_ENDPOINT_NAME,),
+    )
+
+
+@pytest.mark.parametrize("allowed", [False, True])
+def test_mlflow_317_typesafe_requires_use_on_selected_endpoint(monkeypatch, allowed):
+    if not HAS_MLFLOW_3_17_AUTH_SURFACE:
+        pytest.skip("Installed MLflow version does not expose the 3.17 gateway routes.")
+
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.core._parse_jwt_subject", lambda token, claim: "alice"
+    )
+    authorizer = Mock()
+    authorizer.is_allowed.side_effect = [False, allowed]
+    context = AuthorizationRequest(
+        authorization_header="Bearer test-token",
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/gateway/typesafe/v1/systemone",
+        method="POST",
+        workspace="team-a",
+        json_body={"model": "endpoint-a"},
+    )
+    if allowed:
+        _authorize_request(context, authorizer=authorizer, config_values=KubernetesAuthConfig())
+    else:
+        with pytest.raises(MlflowException, match="Permission denied"):
+            _authorize_request(context, authorizer=authorizer, config_values=KubernetesAuthConfig())
+
+    assert authorizer.is_allowed.call_count == 2
+    named_call = authorizer.is_allowed.call_args_list[1]
+    assert named_call.args[1:] == (RESOURCE_GATEWAY_ENDPOINTS, "create", "team-a", "use")
+    assert named_call.kwargs == {"resource_name": "endpoint-a"}
+
+
+def test_mlflow_317_model_listing_requires_broad_list_permission(monkeypatch):
+    if not HAS_MLFLOW_3_17_AUTH_SURFACE:
+        pytest.skip("Installed MLflow version does not expose the 3.17 gateway routes.")
+
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.core._parse_jwt_subject", lambda token, claim: "alice"
+    )
+    authorizer = Mock()
+    authorizer.is_allowed.return_value = False
+    with pytest.raises(MlflowException, match="Permission denied"):
+        _authorize_request(
+            AuthorizationRequest(
+                authorization_header="Bearer test-token",
+                forwarded_access_token=None,
+                remote_user_header_value=None,
+                remote_groups_header_value=None,
+                path="/gateway/mlflow/v1/models",
+                method="GET",
+                workspace="team-a",
+            ),
+            authorizer=authorizer,
+            config_values=KubernetesAuthConfig(),
+        )
+
+    authorizer.is_allowed.assert_called_once()
+    assert authorizer.is_allowed.call_args.args[1:] == (
+        RESOURCE_GATEWAY_ENDPOINTS,
+        "list",
+        "team-a",
+        None,
+    )
 
 
 def test_mlflow_prefixed_custom_path_authorization_rules_are_registered():

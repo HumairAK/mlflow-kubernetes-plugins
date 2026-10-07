@@ -11,6 +11,8 @@ from mlflow_kubernetes_plugins.auth._compat import (
     HAS_MLFLOW_3_13_AUTH_SURFACE,
     HAS_MLFLOW_3_14_AUTH_SURFACE,
     HAS_MLFLOW_3_15_AUTH_SURFACE,
+    HAS_MLFLOW_3_16_AUTH_SURFACE,
+    HAS_MLFLOW_3_17_AUTH_SURFACE,
 )
 from mlflow_kubernetes_plugins.auth.constants import (
     ALLOWED_RESOURCES,
@@ -134,6 +136,8 @@ from mlflow_kubernetes_plugins.auth.rules_v3_15 import (  # noqa: E402
     apply_mcp_registry_deltas,
     apply_v3_15_deltas,
 )
+from mlflow_kubernetes_plugins.auth.rules_v3_16 import apply_v3_16_deltas  # noqa: E402
+from mlflow_kubernetes_plugins.auth.rules_v3_17 import apply_v3_17_deltas  # noqa: E402
 
 REQUEST_AUTHORIZATION_RULES: dict[type, AuthorizationRule | tuple[AuthorizationRule, ...]] = dict(
     BASE_REQUEST_AUTHORIZATION_RULES
@@ -171,6 +175,10 @@ if HAS_MLFLOW_3_15_AUTH_SURFACE:
         request_authorization_rules=REQUEST_AUTHORIZATION_RULES,
         path_authorization_rules=PATH_AUTHORIZATION_RULES,
     )
+if HAS_MLFLOW_3_16_AUTH_SURFACE:
+    apply_v3_16_deltas(path_authorization_rules=PATH_AUTHORIZATION_RULES)
+if HAS_MLFLOW_3_17_AUTH_SURFACE:
+    apply_v3_17_deltas(path_authorization_rules=PATH_AUTHORIZATION_RULES)
 
 
 GRAPHQL_OPERATION_RULES: dict[str, AuthorizationRule] = _build_graphql_operation_rules(

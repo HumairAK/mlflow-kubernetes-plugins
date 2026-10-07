@@ -26,6 +26,8 @@ start with the official guide: <https://mlflow.org/docs/latest/self-hosting/work
 
 ## Install
 
+Supported MLflow versions: 3.10 through 3.17.
+
 Install from PyPI:
 
 ```bash

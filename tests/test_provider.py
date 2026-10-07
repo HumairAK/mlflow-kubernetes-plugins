@@ -118,6 +118,17 @@ def test_list_workspaces_uses_cache(core_api):
     assert [ws.name for ws in second] == ["team-a", "team-b"]
 
 
+@pytest.mark.parametrize("mode", [None, "RESTRICT", "SET_DEFAULT", "CASCADE"])
+def test_delete_workspace_remains_unsupported_with_deletion_mode(core_api, mode):
+    provider = KubernetesWorkspaceProvider()
+    with pytest.raises(NotImplementedError, match="Namespace deletion is not supported"):
+        if mode is None:
+            provider.delete_workspace("team-a")
+        else:
+            provider.delete_workspace("team-a", mode=mode)
+    core_api.delete_namespace.assert_not_called()
+
+
 def test_system_namespaces_are_filtered(core_api):
     namespaces = [
         _namespace("kube-system"),
