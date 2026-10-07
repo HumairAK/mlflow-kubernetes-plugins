@@ -70,6 +70,7 @@ from mlflow_kubernetes_plugins.auth._compat import (
     HAS_MLFLOW_3_13_AUTH_SURFACE,
     HAS_MLFLOW_3_14_AUTH_SURFACE,
     HAS_MLFLOW_3_15_AUTH_SURFACE,
+    HAS_MLFLOW_3_16_AUTH_SURFACE,
     AddGuardrailToEndpoint,
     AddItemsToReviewQueue,
     BatchGetTraceInfos,
@@ -339,6 +340,15 @@ def test_canonicalize_path_static_prefix_applies_to_supported_route_families(mon
     assert _canonicalize_path(raw_path=health_path) == "/health"
     assert _canonicalize_path(raw_path=metrics_path) == "/metrics"
     assert _canonicalize_path(raw_path=version_path) == "/version"
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/gateway/openai/v1/chat/completions", "/v1/traces"],
+)
+def test_canonicalize_gateway_and_otel_paths_with_static_prefix(monkeypatch, path):
+    monkeypatch.setenv(STATIC_PREFIX_ENV_VAR, "/mlflow")
+    assert _canonicalize_path(raw_path=f"/mlflow{path}") == path
 
 
 @pytest.mark.parametrize(
@@ -3401,6 +3411,15 @@ def test_mlflow_315_request_authorization_rules_cover_new_endpoints():
     ):
         assert PATH_AUTHORIZATION_RULES[(prefix, "GET")] == artifact_get_rule
         assert PATH_AUTHORIZATION_RULES[(prefix, "PUT")] == artifact_put_rule
+
+
+def test_mlflow_316_assistant_tool_result_authorization():
+    if not HAS_MLFLOW_3_16_AUTH_SURFACE:
+        pytest.skip("Installed MLflow version does not expose the 3.16 assistant route.")
+
+    assert PATH_AUTHORIZATION_RULES[
+        ("/ajax-api/3.0/mlflow/assistant/sessions/<session_id>/tool-result", "POST")
+    ] == AuthorizationRule("update", resource=RESOURCE_ASSISTANTS)
 
 
 def test_mlflow_prefixed_custom_path_authorization_rules_are_registered():
