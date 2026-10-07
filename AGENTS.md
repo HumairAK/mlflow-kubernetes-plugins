@@ -52,7 +52,9 @@ uv run pre-commit run --all-files              # Run all hooks
 
 ## Patterns
 
-- When adding auth rules for a new MLflow version, follow the pattern in `rules_v3_11.py` and `rules_v3_12.py`: create a new `rules_v3_XX.py` file, add the version-specific rules, and register them in `rules.py`.
+- `rules_base.py` contains the consolidated authorization tables for the minimum supported MLflow version, currently 3.17.
+- When adding auth rules for a newer MLflow version, create a new `rules_v3_XX.py` file (for example, `rules_v3_18.py`) with an `apply_v3_XX_deltas` function that updates the request and/or path rule tables. Register it in `rules.py`, guarded by the corresponding version flag in `_compat.py`, so the minimum supported version keeps its existing rules.
+- When raising the minimum supported MLflow version, fold all deltas through that version into `rules_base.py` and remove the superseded delta files. Preserve effective permissions and route ordering, especially nested MCP routes before catch-all routes.
 - When adding a new collection filter, follow the existing filters in `collection_filters.py`.
 - When adding a new resource type for fine-grained RBAC, add the resource name extraction logic in `resource_names.py`.
 

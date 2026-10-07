@@ -1,13 +1,28 @@
-"""Baseline authorization tables for the minimum supported MLflow contract."""
+"""Baseline authorization tables for the minimum supported MLflow 3.17 contract."""
 
 from __future__ import annotations
 
+from mlflow.protos.issues_pb2 import (
+    CreateIssue,
+    GetIssue,
+    SearchIssues,
+    UpdateIssue,
+)
+from mlflow.protos.label_schemas_pb2 import (
+    CreateLabelSchema,
+    DeleteLabelSchema,
+    GetLabelSchema,
+    GetLabelSchemaByName,
+    ListLabelSchemas,
+    UpdateLabelSchema,
+)
 from mlflow.protos.mlflow_artifacts_pb2 import (
     AbortMultipartUpload,
     CompleteMultipartUpload,
     CreateMultipartUpload,
     DeleteArtifact,
     DownloadArtifact,
+    GetPresignedDownloadUrl,
     UploadArtifact,
 )
 from mlflow.protos.mlflow_artifacts_pb2 import ListArtifacts as ListArtifactsMlflowArtifacts
@@ -33,20 +48,39 @@ from mlflow.protos.model_registry_pb2 import (
     UpdateModelVersion,
     UpdateRegisteredModel,
 )
+from mlflow.protos.review_queues_pb2 import (
+    AddItemsToReviewQueue,
+    CreateReviewQueue,
+    DeleteReviewQueue,
+    GetOrCreateUserQueue,
+    GetReviewQueue,
+    GetReviewQueueByName,
+    ListReviewQueueItems,
+    ListReviewQueues,
+    RemoveItemsFromReviewQueue,
+    SetReviewQueueItemStatus,
+    UpdateReviewQueue,
+)
 from mlflow.protos.service_pb2 import (
     AddDatasetToExperiments,
+    AddGuardrailToEndpoint,
     AttachModelToGatewayEndpoint,
+    BatchGetTraceInfos,
     BatchGetTraces,
     CalculateTraceFilterCorrelation,
     CancelPromptOptimizationJob,
     CreateAssessment,
     CreateDataset,
     CreateExperiment,
+    CreateGatewayBudgetPolicy,
     CreateGatewayEndpoint,
     CreateGatewayEndpointBinding,
+    CreateGatewayGuardrail,
     CreateGatewayModelDefinition,
     CreateGatewaySecret,
     CreateLoggedModel,
+    CreatePresignedDownloadUrl,
+    CreatePresignedUploadUrl,
     CreatePromptOptimizationJob,
     CreateRun,
     CreateWorkspace,
@@ -55,9 +89,11 @@ from mlflow.protos.service_pb2 import (
     DeleteDatasetTag,
     DeleteExperiment,
     DeleteExperimentTag,
+    DeleteGatewayBudgetPolicy,
     DeleteGatewayEndpoint,
     DeleteGatewayEndpointBinding,
     DeleteGatewayEndpointTag,
+    DeleteGatewayGuardrail,
     DeleteGatewayModelDefinition,
     DeleteGatewaySecret,
     DeleteLoggedModel,
@@ -80,7 +116,9 @@ from mlflow.protos.service_pb2 import (
     GetDatasetRecords,
     GetExperiment,
     GetExperimentByName,
+    GetGatewayBudgetPolicy,
     GetGatewayEndpoint,
+    GetGatewayGuardrail,
     GetGatewayModelDefinition,
     GetGatewaySecretInfo,
     GetLoggedModel,
@@ -95,8 +133,12 @@ from mlflow.protos.service_pb2 import (
     LinkPromptsToTrace,
     LinkTracesToRun,
     ListArtifacts,
+    ListEndpointGuardrailConfigs,
+    ListGatewayBudgetPolicies,
+    ListGatewayBudgetWindows,
     ListGatewayEndpointBindings,
     ListGatewayEndpoints,
+    ListGatewayGuardrails,
     ListGatewayModelDefinitions,
     ListGatewaySecretInfos,
     ListLoggedModelArtifacts,
@@ -113,6 +155,7 @@ from mlflow.protos.service_pb2 import (
     QueryTraceMetrics,
     RegisterScorer,
     RemoveDatasetFromExperiments,
+    RemoveGuardrailFromEndpoint,
     RestoreExperiment,
     RestoreRun,
     SearchDatasets,
@@ -133,7 +176,9 @@ from mlflow.protos.service_pb2 import (
     StartTrace,
     StartTraceV3,
     UpdateAssessment,
+    UpdateEndpointGuardrailConfig,
     UpdateExperiment,
+    UpdateGatewayBudgetPolicy,
     UpdateGatewayEndpoint,
     UpdateGatewayModelDefinition,
     UpdateGatewaySecret,
@@ -159,8 +204,11 @@ from mlflow_kubernetes_plugins.auth.collection_filters import (
     COLLECTION_POLICY_REQUEST_TRACE_LOCATIONS,
     COLLECTION_POLICY_RESPONSE_DATASET_SUMMARIES,
     COLLECTION_POLICY_RESPONSE_EXPERIMENTS,
+    COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS,
+    COLLECTION_POLICY_RESPONSE_MCP_SERVERS,
     COLLECTION_POLICY_RESPONSE_MODEL_VERSIONS,
     COLLECTION_POLICY_RESPONSE_REGISTERED_MODELS,
+    COLLECTION_POLICY_RESPONSE_SCORERS,
     COLLECTION_POLICY_RESPONSE_TRACES,
 )
 from mlflow_kubernetes_plugins.auth.constants import (
@@ -177,10 +225,16 @@ from mlflow_kubernetes_plugins.auth.resource_names import (
     RESOURCE_NAME_PARSER_GATEWAY_MODEL_DEFINITION_ID_TO_NAME,
     RESOURCE_NAME_PARSER_GATEWAY_PROXY_ENDPOINT_NAME,
     RESOURCE_NAME_PARSER_GATEWAY_SECRET_ID_TO_NAME,
+    RESOURCE_NAME_PARSER_ISSUE_ID_TO_EXPERIMENT_NAME,
     RESOURCE_NAME_PARSER_JOB_ID_TO_EXPERIMENT_NAME,
+    RESOURCE_NAME_PARSER_MCP_SERVER_NAME,
     RESOURCE_NAME_PARSER_MODEL_ID_TO_EXPERIMENT_NAME,
     RESOURCE_NAME_PARSER_NEW_EXPERIMENT_NAME,
     RESOURCE_NAME_PARSER_NEW_REGISTERED_MODEL_NAME,
+    RESOURCE_NAME_PARSER_OPTIONAL_ACTION_ENDPOINT_ID_TO_NAME,
+    RESOURCE_NAME_PARSER_OPTIONAL_GATEWAY_ENDPOINT_NAME,
+    RESOURCE_NAME_PARSER_OPTIONAL_GATEWAY_SECRET_ID_TO_NAME,
+    RESOURCE_NAME_PARSER_OPTIONAL_TRACE_IDS_TO_EXPERIMENT_NAMES,
     RESOURCE_NAME_PARSER_OTEL_EXPERIMENT_ID_HEADER_TO_NAME,
     RESOURCE_NAME_PARSER_REGISTERED_MODEL_NAME,
     RESOURCE_NAME_PARSER_RUN_ID_TO_EXPERIMENT_NAME,
@@ -194,12 +248,68 @@ from mlflow_kubernetes_plugins.auth.rules import (
     _assistants_rule,
     _datasets_rule,
     _experiments_rule,
+    _gateway_budgets_rule,
     _gateway_endpoints_rule,
     _gateway_endpoints_use_rule,
+    _gateway_guardrails_rule,
     _gateway_model_definitions_rule,
     _gateway_secrets_rule,
+    _gateway_secrets_use_rule,
+    _mcp_servers_rule,
     _registered_models_rule,
     _workspaces_rule,
+)
+
+_GATEWAY_BUDGET_WINDOWS_DENIED_MESSAGE = (
+    "Gateway budget window listing is disabled because the upstream MLflow endpoint "
+    "returns tracker state without workspace filtering."
+)
+
+_ISSUE_INVOKE_RULES = (
+    _experiments_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,),
+    ),
+    _experiments_rule(
+        "get",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_OPTIONAL_TRACE_IDS_TO_EXPERIMENT_NAMES,),
+        allow_if_resource_reference_missing=True,
+    ),
+    _gateway_secrets_use_rule(
+        resource_name_parsers=(RESOURCE_NAME_PARSER_OPTIONAL_GATEWAY_SECRET_ID_TO_NAME,),
+        allow_if_resource_reference_missing=True,
+    ),
+    _gateway_endpoints_use_rule(
+        resource_name_parsers=(RESOURCE_NAME_PARSER_OPTIONAL_GATEWAY_ENDPOINT_NAME,),
+        allow_if_resource_reference_missing=True,
+    ),
+)
+
+_CREATE_GATEWAY_GUARDRAIL_RULES = (
+    _gateway_guardrails_rule("create"),
+    _gateway_endpoints_use_rule(
+        resource_name_parsers=(RESOURCE_NAME_PARSER_OPTIONAL_ACTION_ENDPOINT_ID_TO_NAME,),
+        allow_if_resource_reference_missing=True,
+    ),
+)
+
+_UPDATE_ENDPOINT_GUARDRAIL_RULES = (
+    _gateway_endpoints_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_GATEWAY_ENDPOINT_ID_TO_NAME,),
+        # These operations mutate the endpoint/guardrail association, not the endpoint's
+        # model-definition dependencies, so they should not inherit endpoint dependency checks.
+        skip_gateway_dependency_permissions=True,
+    ),
+    _gateway_guardrails_rule("update"),
+)
+
+_LIST_ENDPOINT_GUARDRAIL_RULES = (
+    _gateway_endpoints_rule(
+        "get",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_GATEWAY_ENDPOINT_ID_TO_NAME,),
+    ),
+    _gateway_guardrails_rule("list"),
 )
 
 BASE_REQUEST_AUTHORIZATION_RULES: dict[type, AuthorizationRule | tuple[AuthorizationRule, ...]] = {
@@ -464,6 +574,8 @@ BASE_REQUEST_AUTHORIZATION_RULES: dict[type, AuthorizationRule | tuple[Authoriza
     ListScorers: _experiments_rule(
         "get",
         resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,),
+        collection_policy=COLLECTION_POLICY_RESPONSE_SCORERS,
+        fallback_to_collection_policy_on_missing_resource_reference=True,
     ),
     GetScorer: _experiments_rule(
         "get",
@@ -767,6 +879,100 @@ BASE_REQUEST_AUTHORIZATION_RULES: dict[type, AuthorizationRule | tuple[Authoriza
         deny_message=WORKSPACE_MUTATION_DENIED_MESSAGE,
         requires_workspace=False,
     ),
+    BatchGetTraceInfos: _experiments_rule(
+        "list",
+        collection_policy=COLLECTION_POLICY_RESPONSE_TRACES,
+    ),
+    GetPresignedDownloadUrl: _experiments_rule(
+        "get",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_ARTIFACT_EXPERIMENT_ID_TO_NAME,),
+    ),
+    CreateIssue: _experiments_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,),
+    ),
+    GetIssue: _experiments_rule(
+        "get",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_ISSUE_ID_TO_EXPERIMENT_NAME,),
+    ),
+    UpdateIssue: _experiments_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_ISSUE_ID_TO_EXPERIMENT_NAME,),
+    ),
+    SearchIssues: _experiments_rule(
+        "list",
+        collection_policy=COLLECTION_POLICY_REQUEST_EXPERIMENT_ID,
+    ),
+    # Budget policies intentionally remain workspace-scoped in this plugin.
+    # MLflow exposes only opaque budget_policy_id values, not a declarative unique name that
+    # could be pre-provisioned through GitOps-friendly RBAC resourceNames, and the extra
+    # granularity would add little operational value for budgets.
+    CreateGatewayBudgetPolicy: _gateway_budgets_rule("create"),
+    GetGatewayBudgetPolicy: _gateway_budgets_rule("get"),
+    UpdateGatewayBudgetPolicy: _gateway_budgets_rule("update"),
+    DeleteGatewayBudgetPolicy: _gateway_budgets_rule("delete"),
+    ListGatewayBudgetPolicies: _gateway_budgets_rule(
+        "list",
+        collection_policy=COLLECTION_POLICY_BROAD_ONLY,
+    ),
+    # Fail closed here until upstream makes the tracker-backed endpoint workspace-aware.
+    ListGatewayBudgetWindows: _gateway_budgets_rule(
+        "list",
+        deny=True,
+        deny_message=_GATEWAY_BUDGET_WINDOWS_DENIED_MESSAGE,
+    ),
+    CreatePresignedUploadUrl: _experiments_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_RUN_ID_TO_EXPERIMENT_NAME,),
+    ),
+    CreateGatewayGuardrail: _CREATE_GATEWAY_GUARDRAIL_RULES,
+    GetGatewayGuardrail: _gateway_guardrails_rule("get"),
+    DeleteGatewayGuardrail: _gateway_guardrails_rule("delete"),
+    ListGatewayGuardrails: _gateway_guardrails_rule("list"),
+    AddGuardrailToEndpoint: _UPDATE_ENDPOINT_GUARDRAIL_RULES,
+    RemoveGuardrailFromEndpoint: _UPDATE_ENDPOINT_GUARDRAIL_RULES,
+    ListEndpointGuardrailConfigs: _LIST_ENDPOINT_GUARDRAIL_RULES,
+    UpdateEndpointGuardrailConfig: _UPDATE_ENDPOINT_GUARDRAIL_RULES,
+    # Label schema CRUD — experiment-scoped.
+    # Endpoints carrying experiment_id get experiment-level resourceName checks.
+    # ID-only endpoints (schema_id) fall back to workspace-level access.
+    CreateLabelSchema: _experiments_rule(
+        "update", resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,)
+    ),
+    GetLabelSchema: _experiments_rule("get"),
+    GetLabelSchemaByName: _experiments_rule(
+        "get", resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,)
+    ),
+    ListLabelSchemas: _experiments_rule(
+        "get", resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,)
+    ),
+    UpdateLabelSchema: _experiments_rule("update"),
+    DeleteLabelSchema: _experiments_rule("update"),
+    # Review queue CRUD — experiment-scoped.
+    CreateReviewQueue: _experiments_rule(
+        "update", resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,)
+    ),
+    GetOrCreateUserQueue: _experiments_rule(
+        "update", resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,)
+    ),
+    GetReviewQueue: _experiments_rule("get"),
+    GetReviewQueueByName: _experiments_rule(
+        "get", resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,)
+    ),
+    ListReviewQueues: _experiments_rule(
+        "get", resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,)
+    ),
+    UpdateReviewQueue: _experiments_rule("update"),
+    DeleteReviewQueue: _experiments_rule("update"),
+    # Review queue item operations — queue_id only, workspace-level access.
+    AddItemsToReviewQueue: _experiments_rule("update"),
+    RemoveItemsFromReviewQueue: _experiments_rule("update"),
+    ListReviewQueueItems: _experiments_rule("get"),
+    SetReviewQueueItemStatus: _experiments_rule("update"),
+    CreatePresignedDownloadUrl: _experiments_rule(
+        "get",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_RUN_ID_TO_EXPERIMENT_NAME,),
+    ),
 }
 
 BASE_PATH_AUTHORIZATION_RULES: dict[
@@ -976,5 +1182,272 @@ BASE_PATH_AUTHORIZATION_RULES: dict[
         _experiments_rule("delete"),
         _datasets_rule("delete"),
         _registered_models_rule("delete"),
+    ),
+    ("/ajax-api/3.0/mlflow/issues/invoke", "POST"): _ISSUE_INVOKE_RULES,
+    ("/ajax-api/3.0/mlflow/issues/invoke/", "POST"): _ISSUE_INVOKE_RULES,
+    ("/ajax-api/3.0/mlflow/assistant/providers/<provider>/models", "GET"): _assistants_rule("get"),
+    ("/gateway/proxy/<endpoint_name>/<path:path>", "POST"): _gateway_endpoints_use_rule(
+        resource_name_parsers=(RESOURCE_NAME_PARSER_GATEWAY_PROXY_ENDPOINT_NAME,)
+    ),
+    ("/ajax-api/3.0/mlflow/genai/evaluate/invoke", "POST"): _experiments_rule(
+        "update", resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,)
+    ),
+    ("/gateway/openai/v1/responses/compact", "POST"): _gateway_endpoints_use_rule(
+        resource_name_parsers=(RESOURCE_NAME_PARSER_GATEWAY_PROXY_ENDPOINT_NAME,),
+    ),
+    (
+        "/ajax-api/3.0/mlflow/assistant/sessions/<session_id>/permission",
+        "POST",
+    ): _assistants_rule("update"),
+    ("/ajax-api/3.0/mlflow/assistant/providers", "GET"): _assistants_rule("get"),
+    ("/api/2.0/mlflow-artifacts/artifacts/<path:artifact_path>", "GET"): _experiments_rule(
+        "get",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_ARTIFACT_EXPERIMENT_ID_TO_NAME,),
+    ),
+    ("/ajax-api/2.0/mlflow-artifacts/artifacts/<path:artifact_path>", "GET"): (
+        _experiments_rule(
+            "get",
+            resource_name_parsers=(RESOURCE_NAME_PARSER_ARTIFACT_EXPERIMENT_ID_TO_NAME,),
+        )
+    ),
+    ("/api/2.0/mlflow-artifacts/artifacts/<path:artifact_path>", "PUT"): _experiments_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_ARTIFACT_EXPERIMENT_ID_TO_NAME,),
+    ),
+    ("/ajax-api/2.0/mlflow-artifacts/artifacts/<path:artifact_path>", "PUT"): (
+        _experiments_rule(
+            "update",
+            resource_name_parsers=(RESOURCE_NAME_PARSER_ARTIFACT_EXPERIMENT_ID_TO_NAME,),
+        )
+    ),
+    ("/ajax-api/3.0/mlflow/mcp-servers", "POST"): _mcp_servers_rule("create"),
+    ("/ajax-api/3.0/mlflow/mcp-servers", "GET"): _mcp_servers_rule(
+        "list",
+        collection_policy=COLLECTION_POLICY_RESPONSE_MCP_SERVERS,
+    ),
+    ("/ajax-api/3.0/mlflow/mcp-servers/endpoints", "GET"): _mcp_servers_rule(
+        "list",
+        collection_policy=COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS,
+    ),
+    ("/ajax-api/3.0/mlflow/mcp-servers/<path:name>/versions", "POST"): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/ajax-api/3.0/mlflow/mcp-servers/<path:name>/versions", "GET"): _mcp_servers_rule(
+        "get",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    (
+        "/ajax-api/3.0/mlflow/mcp-servers/<path:name>/versions/<path:version>",
+        "GET",
+    ): _mcp_servers_rule(
+        "get",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    (
+        "/ajax-api/3.0/mlflow/mcp-servers/<path:name>/versions/<path:version>",
+        "PATCH",
+    ): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    (
+        "/ajax-api/3.0/mlflow/mcp-servers/<path:name>/versions/<path:version>",
+        "DELETE",
+    ): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    (
+        "/ajax-api/3.0/mlflow/mcp-servers/<path:name>/versions/<path:version>/tags",
+        "POST",
+    ): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    (
+        "/ajax-api/3.0/mlflow/mcp-servers/<path:name>/versions/<path:version>/tags/<path:key>",
+        "DELETE",
+    ): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/ajax-api/3.0/mlflow/mcp-servers/<path:name>/endpoints", "POST"): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/ajax-api/3.0/mlflow/mcp-servers/<path:name>/endpoints", "GET"): _mcp_servers_rule(
+        "get",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    (
+        "/ajax-api/3.0/mlflow/mcp-servers/<path:name>/endpoints/<endpoint_id>",
+        "GET",
+    ): _mcp_servers_rule(
+        "get",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    (
+        "/ajax-api/3.0/mlflow/mcp-servers/<path:name>/endpoints/<endpoint_id>",
+        "PATCH",
+    ): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    (
+        "/ajax-api/3.0/mlflow/mcp-servers/<path:name>/endpoints/<endpoint_id>",
+        "DELETE",
+    ): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/ajax-api/3.0/mlflow/mcp-servers/<path:name>/tags", "POST"): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/ajax-api/3.0/mlflow/mcp-servers/<path:name>/tags/<path:key>", "DELETE"): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/ajax-api/3.0/mlflow/mcp-servers/<path:name>/aliases", "POST"): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/ajax-api/3.0/mlflow/mcp-servers/<path:name>/aliases/<path:alias>", "GET"): _mcp_servers_rule(
+        "get",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    (
+        "/ajax-api/3.0/mlflow/mcp-servers/<path:name>/aliases/<path:alias>",
+        "DELETE",
+    ): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    # Keep the catch-all server routes last so nested MCP regexes win first.
+    ("/ajax-api/3.0/mlflow/mcp-servers/<path:name>", "GET"): _mcp_servers_rule(
+        "get",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/ajax-api/3.0/mlflow/mcp-servers/<path:name>", "PATCH"): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/ajax-api/3.0/mlflow/mcp-servers/<path:name>", "DELETE"): _mcp_servers_rule(
+        "delete",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/api/3.0/mlflow/mcp-servers", "POST"): _mcp_servers_rule("create"),
+    ("/api/3.0/mlflow/mcp-servers", "GET"): _mcp_servers_rule(
+        "list",
+        collection_policy=COLLECTION_POLICY_RESPONSE_MCP_SERVERS,
+    ),
+    ("/api/3.0/mlflow/mcp-servers/endpoints", "GET"): _mcp_servers_rule(
+        "list",
+        collection_policy=COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS,
+    ),
+    ("/api/3.0/mlflow/mcp-servers/<path:name>/versions", "POST"): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/api/3.0/mlflow/mcp-servers/<path:name>/versions", "GET"): _mcp_servers_rule(
+        "get",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/api/3.0/mlflow/mcp-servers/<path:name>/versions/<path:version>", "GET"): _mcp_servers_rule(
+        "get",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/api/3.0/mlflow/mcp-servers/<path:name>/versions/<path:version>", "PATCH"): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    (
+        "/api/3.0/mlflow/mcp-servers/<path:name>/versions/<path:version>",
+        "DELETE",
+    ): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    (
+        "/api/3.0/mlflow/mcp-servers/<path:name>/versions/<path:version>/tags",
+        "POST",
+    ): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    (
+        "/api/3.0/mlflow/mcp-servers/<path:name>/versions/<path:version>/tags/<path:key>",
+        "DELETE",
+    ): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/api/3.0/mlflow/mcp-servers/<path:name>/endpoints", "POST"): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/api/3.0/mlflow/mcp-servers/<path:name>/endpoints", "GET"): _mcp_servers_rule(
+        "get",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/api/3.0/mlflow/mcp-servers/<path:name>/endpoints/<endpoint_id>", "GET"): _mcp_servers_rule(
+        "get",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/api/3.0/mlflow/mcp-servers/<path:name>/endpoints/<endpoint_id>", "PATCH"): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    (
+        "/api/3.0/mlflow/mcp-servers/<path:name>/endpoints/<endpoint_id>",
+        "DELETE",
+    ): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/api/3.0/mlflow/mcp-servers/<path:name>/tags", "POST"): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/api/3.0/mlflow/mcp-servers/<path:name>/tags/<path:key>", "DELETE"): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/api/3.0/mlflow/mcp-servers/<path:name>/aliases", "POST"): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/api/3.0/mlflow/mcp-servers/<path:name>/aliases/<path:alias>", "GET"): _mcp_servers_rule(
+        "get",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/api/3.0/mlflow/mcp-servers/<path:name>/aliases/<path:alias>", "DELETE"): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    # Keep the catch-all server routes last so nested MCP regexes win first.
+    ("/api/3.0/mlflow/mcp-servers/<path:name>", "GET"): _mcp_servers_rule(
+        "get",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/api/3.0/mlflow/mcp-servers/<path:name>", "PATCH"): _mcp_servers_rule(
+        "update",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    ("/api/3.0/mlflow/mcp-servers/<path:name>", "DELETE"): _mcp_servers_rule(
+        "delete",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+    ),
+    (
+        "/ajax-api/3.0/mlflow/assistant/sessions/<session_id>/tool-result",
+        "POST",
+    ): _assistants_rule("update"),
+    # This lists gateway endpoint names, matching ListGatewayEndpoints permissions.
+    ("/gateway/mlflow/v1/models", "GET"): _gateway_endpoints_rule(
+        "list", collection_policy=COLLECTION_POLICY_BROAD_ONLY
+    ),
+    ("/gateway/typesafe/v1/systemone", "POST"): _gateway_endpoints_use_rule(
+        resource_name_parsers=(RESOURCE_NAME_PARSER_GATEWAY_PROXY_ENDPOINT_NAME,),
     ),
 }

@@ -4,16 +4,6 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
-from mlflow_kubernetes_plugins.auth._compat import (
-    HAS_MCP_REGISTRY,
-    HAS_MLFLOW_3_11_AUTH_SURFACE,
-    HAS_MLFLOW_3_12_AUTH_SURFACE,
-    HAS_MLFLOW_3_13_AUTH_SURFACE,
-    HAS_MLFLOW_3_14_AUTH_SURFACE,
-    HAS_MLFLOW_3_15_AUTH_SURFACE,
-    HAS_MLFLOW_3_16_AUTH_SURFACE,
-    HAS_MLFLOW_3_17_AUTH_SURFACE,
-)
 from mlflow_kubernetes_plugins.auth.constants import (
     ALLOWED_RESOURCES,
     RESOURCE_ASSISTANTS,
@@ -128,16 +118,6 @@ from mlflow_kubernetes_plugins.auth.rules_base import (  # noqa: E402
     BASE_PATH_AUTHORIZATION_RULES,
     BASE_REQUEST_AUTHORIZATION_RULES,
 )
-from mlflow_kubernetes_plugins.auth.rules_v3_11 import apply_v3_11_deltas  # noqa: E402
-from mlflow_kubernetes_plugins.auth.rules_v3_12 import apply_v3_12_deltas  # noqa: E402
-from mlflow_kubernetes_plugins.auth.rules_v3_13 import apply_v3_13_deltas  # noqa: E402
-from mlflow_kubernetes_plugins.auth.rules_v3_14 import apply_v3_14_deltas  # noqa: E402
-from mlflow_kubernetes_plugins.auth.rules_v3_15 import (  # noqa: E402
-    apply_mcp_registry_deltas,
-    apply_v3_15_deltas,
-)
-from mlflow_kubernetes_plugins.auth.rules_v3_16 import apply_v3_16_deltas  # noqa: E402
-from mlflow_kubernetes_plugins.auth.rules_v3_17 import apply_v3_17_deltas  # noqa: E402
 
 REQUEST_AUTHORIZATION_RULES: dict[type, AuthorizationRule | tuple[AuthorizationRule, ...]] = dict(
     BASE_REQUEST_AUTHORIZATION_RULES
@@ -145,41 +125,6 @@ REQUEST_AUTHORIZATION_RULES: dict[type, AuthorizationRule | tuple[AuthorizationR
 PATH_AUTHORIZATION_RULES: dict[
     tuple[str, str], AuthorizationRule | tuple[AuthorizationRule, ...]
 ] = dict(BASE_PATH_AUTHORIZATION_RULES)
-
-if HAS_MLFLOW_3_11_AUTH_SURFACE:
-    apply_v3_11_deltas(
-        request_authorization_rules=REQUEST_AUTHORIZATION_RULES,
-        path_authorization_rules=PATH_AUTHORIZATION_RULES,
-    )
-if HAS_MLFLOW_3_12_AUTH_SURFACE:
-    apply_v3_12_deltas(
-        request_authorization_rules=REQUEST_AUTHORIZATION_RULES,
-        path_authorization_rules=PATH_AUTHORIZATION_RULES,
-    )
-if HAS_MLFLOW_3_13_AUTH_SURFACE:
-    apply_v3_13_deltas(
-        request_authorization_rules=REQUEST_AUTHORIZATION_RULES,
-        path_authorization_rules=PATH_AUTHORIZATION_RULES,
-    )
-if HAS_MCP_REGISTRY and not HAS_MLFLOW_3_15_AUTH_SURFACE:
-    apply_mcp_registry_deltas(
-        path_authorization_rules=PATH_AUTHORIZATION_RULES,
-    )
-if HAS_MLFLOW_3_14_AUTH_SURFACE:
-    apply_v3_14_deltas(
-        request_authorization_rules=REQUEST_AUTHORIZATION_RULES,
-        path_authorization_rules=PATH_AUTHORIZATION_RULES,
-    )
-if HAS_MLFLOW_3_15_AUTH_SURFACE:
-    apply_v3_15_deltas(
-        request_authorization_rules=REQUEST_AUTHORIZATION_RULES,
-        path_authorization_rules=PATH_AUTHORIZATION_RULES,
-    )
-if HAS_MLFLOW_3_16_AUTH_SURFACE:
-    apply_v3_16_deltas(path_authorization_rules=PATH_AUTHORIZATION_RULES)
-if HAS_MLFLOW_3_17_AUTH_SURFACE:
-    apply_v3_17_deltas(path_authorization_rules=PATH_AUTHORIZATION_RULES)
-
 
 GRAPHQL_OPERATION_RULES: dict[str, AuthorizationRule] = _build_graphql_operation_rules(
     AuthorizationRule, _normalize_resource_name

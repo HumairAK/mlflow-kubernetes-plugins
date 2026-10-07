@@ -200,8 +200,6 @@ from mlflow_kubernetes_plugins.auth.rules import (
     AuthorizationRule,
     _normalize_rules,
 )
-from mlflow_kubernetes_plugins.auth.rules_v3_14 import apply_v3_14_deltas
-from mlflow_kubernetes_plugins.auth.rules_v3_15 import apply_mcp_registry_deltas
 
 from conftest import _authorize_request
 
@@ -5176,32 +5174,6 @@ def test_find_authorization_rules_prefers_nested_mcp_routes():
     assert rules[0].verb == "get"
     assert rules[0].resource == RESOURCE_MCP_SERVERS
     assert rules[0].resource_name_parsers == (RESOURCE_NAME_PARSER_MCP_SERVER_NAME,)
-
-
-def test_apply_mcp_registry_deltas_registers_routes_independently():
-    path_authorization_rules = {}
-
-    apply_mcp_registry_deltas(path_authorization_rules=path_authorization_rules)
-
-    assert ("/api/3.0/mlflow/mcp-servers", "POST") in path_authorization_rules
-    assert ("/ajax-api/3.0/mlflow/mcp-servers", "GET") in path_authorization_rules
-    assert (
-        path_authorization_rules[("/api/3.0/mlflow/mcp-servers", "POST")].resource
-        == RESOURCE_MCP_SERVERS
-    )
-
-
-def test_apply_v3_14_deltas_do_not_register_mcp_routes():
-    request_authorization_rules = {}
-    path_authorization_rules = {}
-
-    apply_v3_14_deltas(
-        request_authorization_rules=request_authorization_rules,
-        path_authorization_rules=path_authorization_rules,
-    )
-
-    assert ("/api/3.0/mlflow/mcp-servers", "POST") not in path_authorization_rules
-    assert ("/ajax-api/3.0/mlflow/genai/evaluate/invoke", "POST") in path_authorization_rules
 
 
 def test_gateway_request_rules_use_resource_name_parsers():
