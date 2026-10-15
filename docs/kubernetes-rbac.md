@@ -22,6 +22,7 @@ The authorization plugin checks access against resources in the `mlflow.kubeflow
 | `datasets` | `get`, `list`, `create`, `update`, `delete` |
 | `experiments` | `get`, `list`, `create`, `update`, `delete` |
 | `mcpservers` | `get`, `list`, `create`, `update`, `delete` |
+| `skills` | `get`, `list`, `create`, `update`, `delete` |
 | `registeredmodels` | `get`, `list`, `create`, `update`, `delete` |
 | `gatewaysecrets` | `get`, `list`, `create`, `update`, `delete` |
 | `gatewaysecrets/use` | `create` |
@@ -47,6 +48,7 @@ Important details:
 - For `datasets`, the `resourceName` is the dataset name
 - For `experiments`, the `resourceName` is the experiment name
 - For `mcpservers`, the `resourceName` is the MCP server name
+- For `skills`, use the skill name or `@organization/name`
 - For `registeredmodels`, the `resourceName` is the registered model name
 - For `gatewaysecrets`, the `resourceName` is the gateway secret name
 - For `gatewayendpoints`, the `resourceName` is the gateway endpoint name
@@ -91,6 +93,19 @@ rules:
     resourceNames: ["exp-a"]
     verbs: ["update"]
 ```
+
+## Skill Registry Permissions
+
+Skill versions, tags, and aliases use `update` on the parent `skills` resource; deleting
+that parent uses `delete`. Skill searches require broad `list` permission; named `get` or
+`list` grants do not authorize searches. Uploaded content requires `get` on its skill,
+independently of experiment permissions. Direct artifact writes are denied; register a new
+version to upload content.
+
+Version registration can create a parent skill or add to an existing parent, so it requires
+both broad `create` permission and `update` permission on the target skill. Bulk registration
+requires broad `create` and broad `update` on skills. Requiring both permissions avoids making
+authorization depend on a parent-existence check that can race with registration.
 
 ## Trusted Proxy Mode
 

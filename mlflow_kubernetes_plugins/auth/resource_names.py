@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import re
 import threading
@@ -40,6 +41,8 @@ RESOURCE_NAME_PARSER_TRACE_V3_EXPERIMENT_ID_TO_NAME = "trace_v3_experiment_id_to
 RESOURCE_NAME_PARSER_ARTIFACT_EXPERIMENT_ID_TO_NAME = "artifact_experiment_id_to_name"
 RESOURCE_NAME_PARSER_OTEL_EXPERIMENT_ID_HEADER_TO_NAME = "otel_experiment_id_header_to_name"
 RESOURCE_NAME_PARSER_MCP_SERVER_NAME = "mcp_server_name"
+RESOURCE_NAME_PARSER_SKILL_NAME = "skill_name"
+RESOURCE_NAME_PARSER_SKILL_ARTIFACT_NAME = "skill_artifact_name"
 RESOURCE_NAME_PARSER_GATEWAY_SECRET_ID_TO_NAME = "gateway_secret_id_to_name"
 RESOURCE_NAME_PARSER_OPTIONAL_GATEWAY_SECRET_ID_TO_NAME = "optional_gateway_secret_id_to_name"
 RESOURCE_NAME_PARSER_GATEWAY_ENDPOINT_ID_TO_NAME = "gateway_endpoint_id_to_name"
@@ -677,6 +680,37 @@ def _parse_mcp_server_name(request_context: AuthorizationRequest) -> tuple[str, 
     return (_get_request_param(request_context, "name"),)
 
 
+def _skill_resource_name(name: object, organization: object = "") -> str:
+    if not isinstance(name, str) or not name or "/" in name or name.startswith("@"):
+        raise ResourceNameResolutionError("Invalid skill name.")
+    if not isinstance(organization, str) or "/" in organization or organization.startswith("@"):
+        raise ResourceNameResolutionError("Invalid skill organization.")
+    return f"@{organization}/{name}" if organization else name
+
+
+def _parse_skill_name(request_context: AuthorizationRequest) -> tuple[str, ...]:
+    # Path identity is authoritative, including the absence of an organization.
+    return (
+        _skill_resource_name(
+            _get_single_value(request_context.path_params, "name"),
+            request_context.path_params.get("organization", ""),
+        ),
+    )
+
+
+def _parse_skill_artifact_name(request_context: AuthorizationRequest) -> tuple[str, ...]:
+    artifact_path = request_context.path_params.get(
+        "artifact_path", request_context.query_params.get("path")
+    )
+    if not isinstance(artifact_path, str):
+        raise ResourceNameResolutionError("Invalid skill artifact path.")
+    artifact_paths = importlib.import_module("mlflow.store.tracking.skill_registry.artifact_paths")
+    identity = artifact_paths.parse_skill_upload_path(artifact_path)
+    if identity is None:
+        raise ResourceNameResolutionError("Invalid skill artifact path.")
+    return (_skill_resource_name(identity.name, identity.organization),)
+
+
 def _parse_gateway_secret_id_to_name(request_context: AuthorizationRequest) -> tuple[str, ...]:
     return (
         _resolve_gateway_secret_name_from_secret_id(
@@ -945,6 +979,8 @@ RESOURCE_NAME_PARSERS: dict[str, "Callable[[AuthorizationRequest], tuple[str, ..
         _parse_otel_experiment_id_header_to_name
     ),
     RESOURCE_NAME_PARSER_MCP_SERVER_NAME: _parse_mcp_server_name,
+    RESOURCE_NAME_PARSER_SKILL_NAME: _parse_skill_name,
+    RESOURCE_NAME_PARSER_SKILL_ARTIFACT_NAME: _parse_skill_artifact_name,
     RESOURCE_NAME_PARSER_GATEWAY_SECRET_ID_TO_NAME: _parse_gateway_secret_id_to_name,
     RESOURCE_NAME_PARSER_OPTIONAL_GATEWAY_SECRET_ID_TO_NAME: (
         _parse_optional_gateway_secret_id_to_name
@@ -1045,6 +1081,8 @@ __all__ = [
     "RESOURCE_NAME_PARSER_ISSUE_ID_TO_EXPERIMENT_NAME",
     "RESOURCE_NAME_PARSER_JOB_ID_TO_EXPERIMENT_NAME",
     "RESOURCE_NAME_PARSER_MCP_SERVER_NAME",
+    "RESOURCE_NAME_PARSER_SKILL_NAME",
+    "RESOURCE_NAME_PARSER_SKILL_ARTIFACT_NAME",
     "RESOURCE_NAME_PARSER_MODEL_ID_TO_EXPERIMENT_NAME",
     "RESOURCE_NAME_PARSER_NEW_EXPERIMENT_NAME",
     "RESOURCE_NAME_PARSER_NEW_REGISTERED_MODEL_NAME",
