@@ -9,9 +9,10 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from mlflow.exceptions import MlflowException
+from mlflow.utils.uri import _decode
 
 from mlflow_kubernetes_plugins.auth.request_context import AuthorizationRequest
 
@@ -698,11 +699,43 @@ def _parse_skill_name(request_context: AuthorizationRequest) -> tuple[str, ...]:
     )
 
 
-def _parse_skill_artifact_name(request_context: AuthorizationRequest) -> tuple[str, ...]:
-    artifact_path = request_context.path_params.get(
-        "artifact_path", request_context.query_params.get("path")
-    )
+def _get_skill_artifact_path(request_context: AuthorizationRequest) -> str | None:
+    """Read MLflow's effective artifact path and validate any workspace prefix."""
+    if "artifact_path" in request_context.path_params:
+        artifact_path = request_context.path_params["artifact_path"]
+    elif request_context.method == "GET" and request_context.query_params:
+        # MLflow ignores the whole GET body whenever any query parameters exist.
+        artifact_path = request_context.query_params.get("path")
+    else:
+        body = request_context.json_body
+        # MLflow also accepts legacy clients that JSON-encode the body twice.
+        if isinstance(body, str):
+            try:
+                body = json.loads(body)
+            except json.JSONDecodeError as exc:
+                raise ResourceNameResolutionError("Invalid artifact path.") from exc
+        artifact_path = (
+            cast(dict[str, object], body).get("path") if isinstance(body, dict) else None
+        )
+    if artifact_path is None:
+        return None
     if not isinstance(artifact_path, str):
+        raise ResourceNameResolutionError("Invalid artifact path.")
+    try:
+        artifact_path = _decode(artifact_path)
+    except ValueError as exc:
+        raise ResourceNameResolutionError("Invalid artifact path.") from exc
+    segments = artifact_path.lstrip("/").split("/", 2)
+    if segments[0] == "workspaces" and len(segments) >= 2:
+        if not segments[1] or segments[1] != request_context.workspace:
+            raise ResourceNameResolutionError("Artifact path targets a different workspace.")
+        return segments[2] if len(segments) == 3 else ""
+    return artifact_path
+
+
+def _parse_skill_artifact_name(request_context: AuthorizationRequest) -> tuple[str, ...]:
+    artifact_path = _get_skill_artifact_path(request_context)
+    if artifact_path is None:
         raise ResourceNameResolutionError("Invalid skill artifact path.")
     artifact_paths = importlib.import_module("mlflow.store.tracking.skill_registry.artifact_paths")
     identity = artifact_paths.parse_skill_upload_path(artifact_path)

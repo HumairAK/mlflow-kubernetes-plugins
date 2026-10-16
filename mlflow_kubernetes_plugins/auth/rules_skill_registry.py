@@ -6,13 +6,14 @@ import importlib
 import posixpath
 
 from mlflow.protos import mlflow_artifacts_pb2 as artifacts_pb2
-from mlflow.utils.uri import _decode
 
 from mlflow_kubernetes_plugins.auth.constants import RESOURCE_SKILLS
 from mlflow_kubernetes_plugins.auth.request_context import AuthorizationRequest
 from mlflow_kubernetes_plugins.auth.resource_names import (
     RESOURCE_NAME_PARSER_SKILL_ARTIFACT_NAME,
     RESOURCE_NAME_PARSER_SKILL_NAME,
+    ResourceNameResolutionError,
+    _get_skill_artifact_path,
 )
 from mlflow_kubernetes_plugins.auth.rules import AuthorizationRule
 
@@ -249,24 +250,34 @@ def apply_skill_registry_deltas(request_rules: dict, path_rules: dict) -> None:
 def skill_artifact_rules(
     context: AuthorizationRequest, original_rules: list[AuthorizationRule]
 ) -> list[AuthorizationRule]:
-    raw_path = context.path_params.get("artifact_path", context.query_params.get("path"))
-    if raw_path is None:
-        return original_rules
-    if not isinstance(raw_path, str):
-        return [AuthorizationRule(None, deny=True, deny_message="Invalid artifact path.")]
     try:
-        decoded = _decode(raw_path)
-    except ValueError:
-        return [AuthorizationRule(None, deny=True, deny_message="Invalid artifact path.")]
+        decoded = _get_skill_artifact_path(context)
+    except ResourceNameResolutionError as exc:
+        return [AuthorizationRule(None, deny=True, deny_message=f"Skill artifacts: {exc}")]
+    if decoded is None:
+        if context.method != "DELETE":
+            return original_rules
+        decoded = ""
     # MLflow normalizes proxy paths. Recognize both the supplied and resolved skill
     # namespace so traversal cannot acquire broader experiment permissions.
     candidates = (decoded, posixpath.normpath(decoded))
     paths = []
     for candidate in candidates:
         segments = candidate.strip("/").split("/")
-        if segments[0].lower() == "workspaces" and len(segments) >= 3:
+        if segments[0].lower() == "workspaces" and len(segments) >= 2:
+            if segments[1] != context.workspace:
+                return [
+                    AuthorizationRule(
+                        None, deny=True, deny_message="Skill artifacts: invalid workspace."
+                    )
+                ]
             segments = segments[2:]
         paths.append("/".join(segments))
+    # Recursive root deletes can remove skill uploads alongside experiment artifacts.
+    if context.method == "DELETE" and any(path in {"", ".", "..", "workspaces"} for path in paths):
+        return [
+            AuthorizationRule(None, deny=True, deny_message="Artifact root deletion is denied.")
+        ]
     if not any(path.split("/")[0].lower() == "skills" for path in paths):
         return original_rules
     artifact_paths = importlib.import_module("mlflow.store.tracking.skill_registry.artifact_paths")

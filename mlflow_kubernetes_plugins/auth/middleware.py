@@ -114,6 +114,9 @@ class KubernetesAuthMiddleware(BaseHTTPMiddleware):
 
     @staticmethod
     def _request_can_have_json_body(request: Request) -> bool:
+        # MLflow force-parses GET JSON bodies regardless of Content-Type.
+        if request.method.upper() == "GET":
+            return True
         return request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"} and (
             "json" in request.headers.get("content-type", "").lower()
         )

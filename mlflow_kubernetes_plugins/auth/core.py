@@ -681,6 +681,12 @@ async def _authorize_request_async(
     if any(rule.check_skill_artifact_permissions for rule in rules):
         from mlflow_kubernetes_plugins.auth.rules_skill_registry import skill_artifact_rules
 
+        if "artifact_path" not in updated_request_context.path_params and not (
+            updated_request_context.method == "GET" and updated_request_context.query_params
+        ):
+            updated_request_context = await _ensure_request_context_json_body(
+                updated_request_context
+            )
         # Classify the artifact before granting broad experiment permission.
         rules = skill_artifact_rules(updated_request_context, rules)
 
