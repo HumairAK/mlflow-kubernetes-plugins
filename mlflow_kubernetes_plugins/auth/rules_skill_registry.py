@@ -22,20 +22,15 @@ def _skills_rule(verb: str, **kwargs) -> AuthorizationRule:
     return AuthorizationRule(verb, resource=RESOURCE_SKILLS, **kwargs)
 
 
-# Registration can create a parent or add a version to an existing parent. Require
-# both permissions so no existence lookup or check/write race can bypass either.
-_REGISTER_VERSION_RULES = (
-    _skills_rule("create"),
-    _skills_rule("update", resource_name_parsers=(RESOURCE_NAME_PARSER_SKILL_NAME,)),
-)
-_BULK_REGISTER_RULES = (_skills_rule("create"), _skills_rule("update"))
-
 SKILL_REGISTRY_PATH_AUTHORIZATION_RULES = {
     ("/api/3.0/mlflow/skills", "POST"): _skills_rule("create"),
     # Require broad list access; response filtering is being phased out.
     ("/api/3.0/mlflow/skills", "GET"): _skills_rule("list"),
-    ("/api/3.0/mlflow/skills/bulk-register", "POST"): _BULK_REGISTER_RULES,
-    ("/api/3.0/mlflow/skills/@<organization>/<name>/versions", "POST"): _REGISTER_VERSION_RULES,
+    ("/api/3.0/mlflow/skills/bulk-register", "POST"): _skills_rule("update"),
+    # Like MCP, version registration uses parent update even if MLflow creates the parent.
+    ("/api/3.0/mlflow/skills/@<organization>/<name>/versions", "POST"): _skills_rule(
+        "update", resource_name_parsers=(RESOURCE_NAME_PARSER_SKILL_NAME,)
+    ),
     ("/api/3.0/mlflow/skills/@<organization>/<name>/versions", "GET"): _skills_rule(
         "get", resource_name_parsers=(RESOURCE_NAME_PARSER_SKILL_NAME,)
     ),
@@ -79,7 +74,9 @@ SKILL_REGISTRY_PATH_AUTHORIZATION_RULES = {
     ("/api/3.0/mlflow/skills/@<organization>/<name>", "DELETE"): _skills_rule(
         "delete", resource_name_parsers=(RESOURCE_NAME_PARSER_SKILL_NAME,)
     ),
-    ("/api/3.0/mlflow/skills/<name>/versions", "POST"): _REGISTER_VERSION_RULES,
+    ("/api/3.0/mlflow/skills/<name>/versions", "POST"): _skills_rule(
+        "update", resource_name_parsers=(RESOURCE_NAME_PARSER_SKILL_NAME,)
+    ),
     ("/api/3.0/mlflow/skills/<name>/versions", "GET"): _skills_rule(
         "get", resource_name_parsers=(RESOURCE_NAME_PARSER_SKILL_NAME,)
     ),
@@ -125,11 +122,11 @@ SKILL_REGISTRY_PATH_AUTHORIZATION_RULES = {
     ("/ajax-api/3.0/mlflow/skills", "POST"): _skills_rule("create"),
     # Require broad list access; response filtering is being phased out.
     ("/ajax-api/3.0/mlflow/skills", "GET"): _skills_rule("list"),
-    ("/ajax-api/3.0/mlflow/skills/bulk-register", "POST"): _BULK_REGISTER_RULES,
+    ("/ajax-api/3.0/mlflow/skills/bulk-register", "POST"): _skills_rule("update"),
     (
         "/ajax-api/3.0/mlflow/skills/@<organization>/<name>/versions",
         "POST",
-    ): _REGISTER_VERSION_RULES,
+    ): _skills_rule("update", resource_name_parsers=(RESOURCE_NAME_PARSER_SKILL_NAME,)),
     ("/ajax-api/3.0/mlflow/skills/@<organization>/<name>/versions", "GET"): _skills_rule(
         "get", resource_name_parsers=(RESOURCE_NAME_PARSER_SKILL_NAME,)
     ),
@@ -176,7 +173,9 @@ SKILL_REGISTRY_PATH_AUTHORIZATION_RULES = {
     ("/ajax-api/3.0/mlflow/skills/@<organization>/<name>", "DELETE"): _skills_rule(
         "delete", resource_name_parsers=(RESOURCE_NAME_PARSER_SKILL_NAME,)
     ),
-    ("/ajax-api/3.0/mlflow/skills/<name>/versions", "POST"): _REGISTER_VERSION_RULES,
+    ("/ajax-api/3.0/mlflow/skills/<name>/versions", "POST"): _skills_rule(
+        "update", resource_name_parsers=(RESOURCE_NAME_PARSER_SKILL_NAME,)
+    ),
     ("/ajax-api/3.0/mlflow/skills/<name>/versions", "GET"): _skills_rule(
         "get", resource_name_parsers=(RESOURCE_NAME_PARSER_SKILL_NAME,)
     ),

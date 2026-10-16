@@ -102,10 +102,10 @@ that parent uses `delete`. Skill searches require broad `list` permission; named
 independently of experiment permissions. Direct artifact writes are denied; register a new
 version to upload content.
 
-Version registration can create a parent skill or add to an existing parent, so it requires
-both broad `create` permission and `update` permission on the target skill. Bulk registration
-requires broad `create` and broad `update` on skills. Requiring both permissions avoids making
-authorization depend on a parent-existence check that can race with registration.
+Like MCP, version registration requires `update` on the target skill, even when registration
+automatically creates the parent. A named `update` grant therefore permits registering both
+the first and subsequent versions of that skill. Bulk registration requires broad `update`
+on skills. Direct parent creation requires broad `create`.
 
 ## Trusted Proxy Mode
 

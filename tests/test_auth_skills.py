@@ -130,21 +130,60 @@ def test_skill_nested_routes_and_named_permissions(skill_auth, prefix):
             )
 
 
-@pytest.mark.parametrize("suffix", ["/visible/versions", "/bulk-register"])
-def test_skill_registration_requires_create_and_update(skill_auth, suffix):
+@pytest.mark.parametrize("prefix", ["/api/3.0", "/ajax-api/3.0"])
+@pytest.mark.parametrize("organization", ["", "team"])
+def test_skill_version_registration_requires_parent_update(skill_auth, prefix, organization):
     authorizer, _ = skill_auth
+    skill_name = f"@{organization}/visible" if organization else "visible"
     context = _request(
-        path=f"/api/3.0/mlflow/skills{suffix}",
+        path=f"{prefix}/mlflow/skills/{skill_name}/versions",
         method="POST",
-        path_params={"name": "visible"},
+        path_params={"name": "visible", "organization": organization},
     )
-    for granted in ({"create"}, {"update"}, set()):
-        authorizer.is_allowed.side_effect = lambda *args, **kwargs: args[2] in granted
+    # An update grant suffices even when registration auto-creates the parent.
+    for granted_name in (None, skill_name):
+        authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
+            args[1:3] == ("skills", "update") and kwargs.get("resource_name") == granted_name
+        )
+        result = _authorize(context, skill_auth)
+        assert {rule.verb for rule in result.rules} == {"update"}
+    for granted_verb, granted_name in (("create", None), ("update", "other")):
+        authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
+            args[1:3] == ("skills", granted_verb) and kwargs.get("resource_name") == granted_name
+        )
         with pytest.raises(MlflowException, match="Permission denied"):
             _authorize(context, skill_auth)
-    authorizer.is_allowed.return_value = True
-    authorizer.is_allowed.side_effect = None
-    assert {rule.verb for rule in _authorize(context, skill_auth).rules} == {"create", "update"}
+
+
+@pytest.mark.parametrize("prefix", ["/api/3.0", "/ajax-api/3.0"])
+def test_skill_bulk_registration_requires_broad_update(skill_auth, prefix):
+    authorizer, _ = skill_auth
+    context = _request(
+        path=f"{prefix}/mlflow/skills/bulk-register",
+        method="POST",
+        path_params={},
+    )
+    for granted_verb, granted_name in (("create", None), ("update", "visible")):
+        authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
+            args[1:3] == ("skills", granted_verb) and kwargs.get("resource_name") == granted_name
+        )
+        with pytest.raises(MlflowException, match="Permission denied"):
+            _authorize(context, skill_auth)
+    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
+        args[1:3] == ("skills", "update") and kwargs.get("resource_name") is None
+    )
+    assert {rule.verb for rule in _authorize(context, skill_auth).rules} == {"update"}
+
+
+@pytest.mark.parametrize("prefix", ["/api/3.0", "/ajax-api/3.0"])
+def test_skill_parent_creation_still_requires_create(skill_auth, prefix):
+    authorizer, _ = skill_auth
+    context = _request(path=f"{prefix}/mlflow/skills", method="POST", path_params={})
+    authorizer.is_allowed.side_effect = lambda *args, **kwargs: args[1:3] == ("skills", "update")
+    with pytest.raises(MlflowException, match="Permission denied"):
+        _authorize(context, skill_auth)
+    authorizer.is_allowed.side_effect = lambda *args, **kwargs: args[1:3] == ("skills", "create")
+    assert {rule.verb for rule in _authorize(context, skill_auth).rules} == {"create"}
 
 
 @pytest.mark.parametrize("listing", [False, True])
@@ -228,7 +267,7 @@ def test_experiment_artifacts_keep_existing_authorization(skill_auth):
     assert _authorize(context, skill_auth).rules[0].resource == "experiments"
     assert (
         _find_authorization_rules("/api/3.0/mlflow/skills/bulk-register", "POST")[0].verb
-        == "create"
+        == "update"
     )
 
 
