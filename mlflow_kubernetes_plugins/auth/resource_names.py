@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 from mlflow.exceptions import MlflowException
-from mlflow.utils.uri import _decode
+from mlflow.utils.uri import _decode, is_file_uri
 
 from mlflow_kubernetes_plugins.auth.request_context import AuthorizationRequest
 
@@ -723,8 +723,12 @@ def _get_skill_artifact_path(request_context: AuthorizationRequest) -> str | Non
         raise ResourceNameResolutionError("Invalid artifact path.")
     try:
         artifact_path = _decode(artifact_path)
+        file_uri = is_file_uri(artifact_path)
     except ValueError as exc:
         raise ResourceNameResolutionError("Invalid artifact path.") from exc
+    # MLflow converts file URIs to local paths, including an empty artifact root.
+    if file_uri:
+        raise ResourceNameResolutionError("File URIs are not allowed in artifact paths.")
     segments = artifact_path.lstrip("/").split("/", 2)
     if segments[0] == "workspaces" and len(segments) >= 2:
         if not segments[1] or segments[1] != request_context.workspace:

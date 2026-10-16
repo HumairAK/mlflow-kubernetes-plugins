@@ -348,6 +348,36 @@ def test_artifact_root_deletion_is_denied_over_http(skill_artifact_http, artifac
     authorizer.is_allowed.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "artifact_path",
+    [
+        "file://localhost",
+        "file:",
+        "FILE://localhost",
+        "file://localhost/skills/hidden/token",
+        "file%3A%2F%2Flocalhost",
+        "file%253A%252F%252Flocalhost",
+    ],
+)
+@pytest.mark.parametrize("request_kind", ["delete", "query", "body"])
+def test_file_uri_artifact_requests_are_denied_over_http(
+    skill_artifact_http, artifact_path, request_kind
+):
+    client, authorizer, repo = skill_artifact_http
+    authorizer.is_allowed.return_value = True
+    endpoint = "/api/2.0/mlflow-artifacts/artifacts"
+    if request_kind == "delete":
+        response = client.request("DELETE", f"{endpoint}/{artifact_path}", json={})
+    elif request_kind == "query":
+        response = client.get(endpoint, params={"path": artifact_path})
+    else:
+        response = client.request("GET", endpoint, json={"path": artifact_path})
+    assert response.status_code == 403, response.text
+    assert "File URIs" in response.text
+    assert repo.method_calls == []
+    authorizer.is_allowed.assert_not_called()
+
+
 @pytest.mark.parametrize("artifact_path", [None, "", "/", ".", "workspaces/team-a/."])
 def test_artifact_root_delete_variants_are_denied(skill_auth, artifact_path):
     authorizer, _ = skill_auth
