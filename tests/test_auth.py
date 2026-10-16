@@ -72,6 +72,7 @@ from mlflow_kubernetes_plugins.auth._compat import (
     HAS_MLFLOW_3_15_AUTH_SURFACE,
     HAS_MLFLOW_3_16_AUTH_SURFACE,
     HAS_MLFLOW_3_17_AUTH_SURFACE,
+    HAS_SKILL_REGISTRY,
     AddGuardrailToEndpoint,
     AddItemsToReviewQueue,
     BatchGetTraceInfos,
@@ -154,6 +155,7 @@ from mlflow_kubernetes_plugins.auth.constants import (
     RESOURCE_GATEWAY_SECRETS,
     RESOURCE_MCP_SERVERS,
     RESOURCE_REGISTERED_MODELS,
+    RESOURCE_SKILLS,
     WORKSPACES_ENABLED_ENV,
 )
 from mlflow_kubernetes_plugins.auth.core import (
@@ -3407,10 +3409,16 @@ def test_mlflow_315_request_authorization_rules_cover_new_endpoints():
 
     artifact_path_parsers = (RESOURCE_NAME_PARSER_ARTIFACT_EXPERIMENT_ID_TO_NAME,)
     artifact_get_rule = AuthorizationRule(
-        "get", resource=RESOURCE_EXPERIMENTS, resource_name_parsers=artifact_path_parsers
+        "get",
+        resource=RESOURCE_EXPERIMENTS,
+        resource_name_parsers=artifact_path_parsers,
+        check_skill_artifact_permissions=HAS_SKILL_REGISTRY,
     )
     artifact_put_rule = AuthorizationRule(
-        "update", resource=RESOURCE_EXPERIMENTS, resource_name_parsers=artifact_path_parsers
+        "update",
+        resource=RESOURCE_EXPERIMENTS,
+        resource_name_parsers=artifact_path_parsers,
+        check_skill_artifact_permissions=HAS_SKILL_REGISTRY,
     )
     for prefix in (
         "/api/2.0/mlflow-artifacts/artifacts/<path:artifact_path>",
@@ -4773,7 +4781,7 @@ def test_can_access_workspace_iterates_priority_resources(monkeypatch):
     assert authorizer.can_access_workspace(identity, "team-b", verb="get") is False
 
     calls = authorizer.is_allowed.call_args_list
-    assert len(calls) == 9
+    assert len(calls) == 10
     assert [c[0][1] for c in calls] == [
         RESOURCE_EXPERIMENTS,
         RESOURCE_DATASETS,
@@ -4784,6 +4792,7 @@ def test_can_access_workspace_iterates_priority_resources(monkeypatch):
         RESOURCE_GATEWAY_MODEL_DEFINITIONS,
         RESOURCE_GATEWAY_BUDGETS,
         RESOURCE_GATEWAY_GUARDRAILS,
+        RESOURCE_SKILLS,
     ]
 
 

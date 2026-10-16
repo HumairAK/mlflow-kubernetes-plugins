@@ -40,6 +40,8 @@ class AuthorizationRule(NamedTuple):
     # Skip generic gateway dependency checks when a rule reuses a gateway resource for
     # authorization shape but does not actually consume that resource's usual dependencies.
     skip_gateway_dependency_permissions: bool = False
+    # Artifact proxy requests can address skill content as well as experiment artifacts.
+    check_skill_artifact_permissions: bool = False
 
 
 def _assistants_rule(verb: str | None, **kwargs) -> AuthorizationRule:
@@ -125,6 +127,13 @@ REQUEST_AUTHORIZATION_RULES: dict[type, AuthorizationRule | tuple[AuthorizationR
 PATH_AUTHORIZATION_RULES: dict[
     tuple[str, str], AuthorizationRule | tuple[AuthorizationRule, ...]
 ] = dict(BASE_PATH_AUTHORIZATION_RULES)
+
+from mlflow_kubernetes_plugins.auth._compat import HAS_SKILL_REGISTRY  # noqa: E402
+
+if HAS_SKILL_REGISTRY:
+    from mlflow_kubernetes_plugins.auth.rules_skill_registry import apply_skill_registry_deltas
+
+    apply_skill_registry_deltas(REQUEST_AUTHORIZATION_RULES, PATH_AUTHORIZATION_RULES)
 
 GRAPHQL_OPERATION_RULES: dict[str, AuthorizationRule] = _build_graphql_operation_rules(
     AuthorizationRule, _normalize_resource_name
