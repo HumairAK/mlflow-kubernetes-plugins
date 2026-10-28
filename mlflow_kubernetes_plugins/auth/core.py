@@ -23,9 +23,18 @@ from mlflow_kubernetes_plugins.auth.authorizer import (
     KubernetesAuthorizer,
 )
 from mlflow_kubernetes_plugins.auth.collection_filters import (
+    COLLECTION_POLICY_BROAD_ONLY,
+    COLLECTION_POLICY_REQUEST_AUTHORIZED_EXPERIMENT_IDS,
+    COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS,
+    COLLECTION_POLICY_REQUEST_BATCH_GET_TRACES,
+    COLLECTION_POLICY_REQUEST_LIST_SCORERS,
+    COLLECTION_POLICY_REQUEST_SEARCH_DATASETS,
+    COLLECTION_POLICY_REQUEST_SEARCH_EXPERIMENTS,
+    COLLECTION_POLICY_REQUEST_SEARCH_MODEL_VERSIONS,
+    COLLECTION_POLICY_REQUEST_SEARCH_REGISTERED_MODELS,
     apply_request_collection_filter,
     is_graphql_collection_policy,
-    is_response_filter_policy,
+    normalize_collection_request,
 )
 from mlflow_kubernetes_plugins.auth.constants import (
     DEFAULT_REMOTE_GROUPS_SEPARATOR,
@@ -62,11 +71,23 @@ from mlflow_kubernetes_plugins.auth.rules import (
 )
 
 if not hasattr(werkzeug, "__version__"):  # pragma: no cover - compatibility shim
-    werkzeug.__version__ = "werkzeug"
+    setattr(werkzeug, "__version__", "werkzeug")
 
 _logger = logging.getLogger(__name__)
 _AUTHORIZATION_HANDLED: ContextVar[_AuthorizationResult | None] = ContextVar(
     "_AUTHORIZATION_HANDLED", default=None
+)
+_COLLECTION_POLICIES_REQUIRING_REQUEST_BODY = frozenset(
+    {
+        COLLECTION_POLICY_REQUEST_AUTHORIZED_EXPERIMENT_IDS,
+        COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS,
+        COLLECTION_POLICY_REQUEST_BATCH_GET_TRACES,
+        COLLECTION_POLICY_REQUEST_LIST_SCORERS,
+        COLLECTION_POLICY_REQUEST_SEARCH_EXPERIMENTS,
+        COLLECTION_POLICY_REQUEST_SEARCH_DATASETS,
+        COLLECTION_POLICY_REQUEST_SEARCH_MODEL_VERSIONS,
+        COLLECTION_POLICY_REQUEST_SEARCH_REGISTERED_MODELS,
+    }
 )
 
 
@@ -279,6 +300,8 @@ class _AuthorizationResult:
     rules: list[AuthorizationRule]
     request_context: AuthorizationRequest
     username: str | None
+    # Kept for compatibility with callers that inspect the authorization result.
+    # Collection filtering is request-side now, so this remains false.
     response_filter_required: bool = False
 
     @property
@@ -336,9 +359,8 @@ def _extract_workspace_scope_from_request(
     when the context is absent.
     """
     path_params = request_context.path_params
-    if isinstance(path_params.get("workspace_name"), str) and (
-        candidate := path_params["workspace_name"].strip()
-    ):
+    workspace_name = path_params.get("workspace_name")
+    if isinstance(workspace_name, str) and (candidate := workspace_name.strip()):
         return candidate
 
     if not rule.workspace_access_check:
@@ -583,6 +605,8 @@ async def _enforce_gateway_budget_scope(
 
 async def _ensure_request_context_json_body(
     request_context: AuthorizationRequest,
+    *,
+    allow_get_body: bool = False,
 ) -> AuthorizationRequest:
     """Return an ``AuthorizationRequest`` that has its JSON body loaded.
 
@@ -590,8 +614,16 @@ async def _ensure_request_context_json_body(
     original *request_context* is returned unchanged.  Otherwise the callback
     is invoked to fetch the raw body and a new ``AuthorizationRequest`` is
     constructed with the loaded ``json_body`` and derived ``graphql_payload``.
+    GET bodies are loaded when query parameters are absent, matching MLflow's
+    request parsing, or when explicitly requested with ``allow_get_body``.
     """
     if request_context.json_body is not None or request_context.ensure_json_body is None:
+        return request_context
+    if (
+        request_context.method.upper() == "GET"
+        and request_context.query_params
+        and not allow_get_body
+    ):
         return request_context
     loaded_body = await request_context.ensure_json_body()
     return replace(
@@ -685,7 +717,7 @@ async def _authorize_request_async(
             updated_request_context.method == "GET" and updated_request_context.query_params
         ):
             updated_request_context = await _ensure_request_context_json_body(
-                updated_request_context
+                updated_request_context, allow_get_body=True
             )
         # Classify the artifact before granting broad experiment permission.
         rules = skill_artifact_rules(updated_request_context, rules)
@@ -712,7 +744,6 @@ async def _authorize_request_async(
             error_code=databricks_pb2.PERMISSION_DENIED,
         )
 
-    response_filter_required = False
     for rule in rules:
         if rule.deny:
             deny_message = rule.deny_message
@@ -734,6 +765,11 @@ async def _authorize_request_async(
             )
 
         if rule.verb is not None:
+            if not resolved_workspace_name:
+                raise MlflowException(
+                    _WORKSPACE_REQUIRED_ERROR_MESSAGE,
+                    error_code=databricks_pb2.INVALID_PARAMETER_VALUE,
+                )
             if rule.resource == RESOURCE_GATEWAY_BUDGETS and rule.verb in {"create", "update"}:
                 updated_request_context = await _enforce_gateway_budget_scope(
                     updated_request_context, rule
@@ -753,9 +789,31 @@ async def _authorize_request_async(
                 rule.subresource,
             )
             has_broad_permission = has_permission
-            response_or_graphql_filter_policy = is_response_filter_policy(
-                rule.collection_policy
-            ) or is_graphql_collection_policy(rule.collection_policy)
+            if (
+                has_permission
+                and rule.collection_policy == COLLECTION_POLICY_REQUEST_LIST_SCORERS
+                and not updated_request_context.query_params
+            ):
+                # MLflow parses GET bodies, but checks the query string for the
+                # presence of experiment_ids. Preserve that selector even when
+                # broad get permission skips named-scope discovery.
+                updated_request_context = await _ensure_request_context_json_body(
+                    updated_request_context, allow_get_body=True
+                )
+                updated_request_context, normalized = normalize_collection_request(
+                    updated_request_context, rule.collection_policy
+                )
+                if (
+                    not normalized
+                    or updated_request_context.query_params.get("experiment_ids") == []
+                ):
+                    # Empty repeated fields disappear when encoded as a query;
+                    # reject them rather than accidentally listing all scorers.
+                    raise MlflowException(
+                        "Invalid scorer collection input; experiment_ids must be nonempty if set.",
+                        error_code=databricks_pb2.INVALID_PARAMETER_VALUE,
+                    )
+            response_or_graphql_filter_policy = is_graphql_collection_policy(rule.collection_policy)
             hybrid_missing_reference_filter_rule = (
                 rule.resource_name_parsers
                 and rule.fallback_to_collection_policy_on_missing_resource_reference
@@ -792,11 +850,9 @@ async def _authorize_request_async(
                     )
                     for resource_name in resource_names
                 )
-            # Hybrid rules like ListScorers still need us to record when the request took the
-            # unscoped collection path, even if the caller already has the broad permission.
-            # The middleware may later skip actual response filtering when that broad permission
-            # already covers every returned row, but the auth core still needs to classify the
-            # request shape correctly here.
+            # Hybrid rules like GraphQL fields still need us to record when the request
+            # took the unscoped collection path, even if the caller already has the broad
+            # permission, so the GraphQL field resolver can apply its own query-driven scoping.
             response_filter_on_missing_reference = (
                 has_broad_permission and hybrid_missing_reference_filter_rule
             )
@@ -808,10 +864,18 @@ async def _authorize_request_async(
                     resolve_resource_names(updated_request_context, rule.resource_name_parsers)
                 except ResourceReferenceNotPresentError:
                     resource_reference_missing = True
-                    response_filter_required = True
                 except ResourceNameResolutionError:
                     pass
-            if not has_permission and rule.collection_policy:
+            if not has_permission and rule.collection_policy not in {
+                None,
+                COLLECTION_POLICY_BROAD_ONLY,
+            }:
+                if rule.collection_policy in _COLLECTION_POLICIES_REQUIRING_REQUEST_BODY:
+                    # Intersect both query and body sources; do not accept a query-only
+                    # scope before a possibly conflicting JSON body has been read.
+                    updated_request_context = await _ensure_request_context_json_body(
+                        updated_request_context, allow_get_body=True
+                    )
                 updated_request_context, request_filter_applied = apply_request_collection_filter(
                     updated_request_context,
                     rule.collection_policy,
@@ -836,7 +900,6 @@ async def _authorize_request_async(
                     has_permission = True
                 elif response_or_graphql_filter_policy:
                     if not hybrid_missing_reference_filter_rule or resource_reference_missing:
-                        response_filter_required = True
                         has_permission = True
             if not has_permission:
                 raise MlflowException(
@@ -879,7 +942,6 @@ async def _authorize_request_async(
         rules=rules,
         request_context=updated_request_context,
         username=username,
-        response_filter_required=response_filter_required,
     )
 
 

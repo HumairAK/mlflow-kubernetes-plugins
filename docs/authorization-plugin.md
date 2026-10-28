@@ -67,6 +67,9 @@ export MLFLOW_K8S_AUTH_REMOTE_GROUPS_SEPARATOR="|"
 
 Use this mode only behind a trusted proxy such as `kube-rbac-proxy` that authenticates callers before forwarding requests to MLflow.
 
+Named collection scope discovery is enabled by default and requires constrained
+impersonation. See [trusted-proxy RBAC and cluster requirements](kubernetes-rbac.md#trusted-proxy-mode).
+
 ## Single-Namespace Mode
 
 If you do not want to run MLflow with workspaces enabled, disable workspace resolution in the
@@ -111,7 +114,7 @@ plugin uses the configured namespace instead.
 - workspace listings are filtered by the caller's visible namespaces
 - GraphQL and FastAPI routes are covered in addition to the classic Flask endpoints
 - MCP registry FastAPI routes are authorized through the `mcpservers` pseudo-resource, and
-  MCP server and binding collection responses are filtered to the caller's readable servers
+  MCP server and access-endpoint collection requests are narrowed to the caller's readable servers
 - GraphQL collection fields use server-side filtering, while single-object GraphQL reads keep explicit request-time authorization
 - gateway resource access uses `use` subresources for fine-grained RBAC checks
 - gateway guardrails use the dedicated `gatewayguardrails` resource but remain workspace-scoped

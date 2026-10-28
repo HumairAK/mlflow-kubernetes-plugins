@@ -16,6 +16,15 @@ def _authorize_request(request_context, *, authorizer, config_values):
     )
 
 
+@pytest.fixture(autouse=True)
+def _clear_experiment_id_cache():
+    from mlflow_kubernetes_plugins.auth.resource_names import _experiment_id_cache
+
+    _experiment_id_cache.clear()
+    yield
+    _experiment_id_cache.clear()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _mock_namespace_watch():
     patcher = pytest.MonkeyPatch()

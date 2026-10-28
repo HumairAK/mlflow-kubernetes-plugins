@@ -9,9 +9,10 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Generic, TypeVar, cast
 
 from mlflow.exceptions import MlflowException
+from mlflow.utils import workspace_context
 from mlflow.utils.uri import _decode, is_file_uri
 
 from mlflow_kubernetes_plugins.auth.request_context import AuthorizationRequest
@@ -77,11 +78,14 @@ class _OptionalRequestParamResult:
     is_explicitly_empty: bool
 
 
-class _NameLookupCache:
+_LookupKey = TypeVar("_LookupKey")
+
+
+class _NameLookupCache(Generic[_LookupKey]):
     def __init__(self, ttl_seconds: float, max_entries: int) -> None:
         self._ttl_seconds = ttl_seconds
         self._max_entries = max_entries
-        self._entries: OrderedDict[str, tuple[str, float]] = OrderedDict()
+        self._entries: OrderedDict[_LookupKey, tuple[str, float]] = OrderedDict()
         self._lock = threading.RLock()
 
     def _reap_expired(self, now: float) -> None:
@@ -91,7 +95,7 @@ class _NameLookupCache:
         for cache_key in expired_keys:
             self._entries.pop(cache_key, None)
 
-    def get(self, cache_key: str) -> str | None:
+    def get(self, cache_key: _LookupKey) -> str | None:
         with self._lock:
             entry = self._entries.get(cache_key)
             if entry is None:
@@ -104,7 +108,7 @@ class _NameLookupCache:
             self._entries.pop(cache_key, None)
         return None
 
-    def set(self, cache_key: str, name: str) -> None:
+    def set(self, cache_key: _LookupKey, name: str) -> None:
         with self._lock:
             now = time.time()
             self._reap_expired(now)
@@ -113,16 +117,57 @@ class _NameLookupCache:
                 self._entries.popitem(last=False)
             self._entries[cache_key] = (name, now + self._ttl_seconds)
 
-    def invalidate(self, cache_key: str) -> None:
+    def invalidate(self, cache_key: _LookupKey) -> None:
         with self._lock:
             self._entries.pop(cache_key, None)
 
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
 
-_experiment_name_cache = _NameLookupCache(
+
+@dataclass(frozen=True)
+class _ExperimentNameLookupKey:
+    workspace: str | None
+    name: str
+
+
+class _ExperimentIdLookupCache(_NameLookupCache[_ExperimentNameLookupKey]):
+    def __init__(self, ttl_seconds: float, max_entries: int) -> None:
+        super().__init__(ttl_seconds, max_entries)
+        self._generation = 0
+
+    def resolve(
+        self, key: _ExperimentNameLookupKey, lookup: Callable[[], str | None]
+    ) -> str | None:
+        with self._lock:
+            if cached_id := self.get(key):
+                return cached_id
+            generation = self._generation
+
+        # Do not hold the cache lock while querying storage.
+        experiment_id = lookup()
+        with self._lock:
+            # A concurrent rename/delete must not leave a stale mapping cached.
+            if experiment_id is not None and generation == self._generation:
+                self.set(key, experiment_id)
+        return experiment_id
+
+    def clear(self) -> None:
+        with self._lock:
+            self._generation += 1
+            super().clear()
+
+
+_experiment_name_cache = _NameLookupCache[str](
     _EXPERIMENT_NAME_CACHE_TTL_SECONDS,
     max_entries=_LOOKUP_CACHE_MAX_ENTRIES,
 )
-_run_experiment_name_cache = _NameLookupCache(
+_run_experiment_name_cache = _NameLookupCache[str](
+    _EXPERIMENT_NAME_CACHE_TTL_SECONDS,
+    max_entries=_LOOKUP_CACHE_MAX_ENTRIES,
+)
+_experiment_id_cache = _ExperimentIdLookupCache(
     _EXPERIMENT_NAME_CACHE_TTL_SECONDS,
     max_entries=_LOOKUP_CACHE_MAX_ENTRIES,
 )
@@ -309,6 +354,36 @@ def _resolve_experiment_name_from_experiment_id(experiment_id: str) -> str:
         )
     _experiment_name_cache.set(experiment_id, experiment_name)
     return experiment_name
+
+
+def _lookup_experiment_id_by_name(store, name: str) -> str | None:
+    try:
+        experiment = store.get_experiment_by_name(name)
+    except MlflowException as exc:
+        raise ResourceNameResolutionError(f"Could not resolve experiment named '{name}'.") from exc
+    if experiment is None:
+        return None
+    if getattr(experiment, "name", None) != name:
+        raise ResourceNameResolutionError("Experiment name lookup returned a different name.")
+    experiment_id = _normalize_string(getattr(experiment, "experiment_id", None))
+    if experiment_id is None:
+        raise ResourceNameResolutionError("Experiment name lookup returned no ID.")
+    return experiment_id
+
+
+def resolve_experiment_ids_from_names(names: tuple[str, ...]) -> tuple[str, ...]:
+    """Resolve already-authorized names with a bounded, workspace-scoped cache."""
+    store = _get_tracking_store()
+    workspace = workspace_context.get_request_workspace()
+    experiment_ids: list[str] = []
+    for name in dict.fromkeys(names):
+        experiment_id = _experiment_id_cache.resolve(
+            _ExperimentNameLookupKey(workspace, name),
+            lambda: _lookup_experiment_id_by_name(store, name),
+        )
+        if experiment_id is not None:
+            experiment_ids.append(experiment_id)
+    return tuple(dict.fromkeys(experiment_ids))
 
 
 def _resolve_experiment_name_from_run_id(run_id: str) -> str:
@@ -1066,6 +1141,7 @@ def resolve_resource_names(
 
 
 def update_experiment_name_cache(experiment_id: str, experiment_name: str) -> None:
+    _experiment_id_cache.clear()
     normalized_id = _normalize_string(experiment_id)
     normalized_name = _normalize_string(experiment_name)
     if normalized_id is None or normalized_name is None:
@@ -1079,13 +1155,19 @@ def apply_response_cache_updates(
     *,
     status_code: int,
 ) -> None:
-    """Refresh short-lived name caches from successful write responses.
-
-    Today this is used to keep experiment-id-to-name fallback lookups current after renames so
-    follow-up resourceName authorization checks can avoid a tracking-store round trip.
-    """
+    """Refresh or invalidate experiment-name cache entries after successful writes."""
     if status_code >= 400:
         return
+
+    if request_context.path in {
+        "/api/2.0/mlflow/experiments/delete",
+        "/ajax-api/2.0/mlflow/experiments/delete",
+    }:
+        _experiment_id_cache.clear()
+        try:
+            _experiment_name_cache.invalidate(_get_request_param(request_context, "experiment_id"))
+        except ResourceNameResolutionError:
+            pass
 
     parser_ids = {parser_id for rule in rules for parser_id in rule.resource_name_parsers}
     if {
@@ -1098,6 +1180,8 @@ def apply_response_cache_updates(
                 _get_request_param(request_context, "new_name"),
             )
         except ResourceNameResolutionError:
+            _experiment_id_cache.clear()
+            _experiment_name_cache.clear()
             return
 
 
