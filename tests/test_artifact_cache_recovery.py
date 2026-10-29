@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from kubernetes.client.exceptions import ApiException
+from mlflow.exceptions import MlflowException
 from mlflow_kubernetes_plugins.workspace_plugin import caches
 from urllib3.exceptions import ReadTimeoutError
 
@@ -48,6 +49,8 @@ def artifact_cache(request, monkeypatch):
         list_api.return_value = listing(item("old"), item("changed"))
         cache = caches.MlflowConfigCache(api, ensure_secret_cache)
         get = cache.get_config
+        lookup_api = list_api
+        lookup_kwargs = dict(kwargs, field_selector="metadata.namespace=new")
     else:
         item = secret
 
@@ -61,6 +64,9 @@ def artifact_cache(request, monkeypatch):
         list_api.return_value = listing(item("old"), item("changed"))
         cache = caches.SecretCache(api)
         get = cache.get_secret
+        lookup_api = api.list_namespaced_secret
+        lookup_api.return_value = listing()
+        lookup_kwargs = dict(kwargs, namespace="new", watch=False)
     list_api.reset_mock()
     monkeypatch.setattr(cache._stop_event, "wait", lambda timeout: False)
     return SimpleNamespace(
@@ -70,6 +76,8 @@ def artifact_cache(request, monkeypatch):
         item=item,
         listing=listing,
         list_api=list_api,
+        lookup_api=lookup_api,
+        lookup_kwargs=dict(lookup_kwargs, _request_timeout=(5, 30)),
         kwargs=kwargs,
         ensure_secret_cache=ensure_secret_cache,
     )
@@ -106,8 +114,9 @@ def test_reconnect_repairs_additions_modifications_and_deletions(
     second = MagicMock()
 
     def recovered(*args, **kwargs):
-        assert ctx.get("old") is None
-        assert ctx.get("obsolete") is None
+        snapshot = cache._configs if ctx.kind == "config" else cache._secrets
+        assert "old" not in snapshot
+        assert "obsolete" not in snapshot
         assert ctx.get("new").namespace == "new"
         info = ctx.get("changed")
         if ctx.kind == "config":
@@ -218,7 +227,8 @@ def test_resource_events_keep_updating_cache(artifact_cache, event_type):
     ctx = artifact_cache
     ctx.cache._handle_event({"type": event_type, "object": ctx.item("old", version="9")})
     assert ctx.cache._resource_version == "9"
-    assert (ctx.get("old") is None) == (event_type == "DELETED")
+    snapshot = ctx.cache._configs if ctx.kind == "config" else ctx.cache._secrets
+    assert ("old" not in snapshot) == (event_type == "DELETED")
     ctx.list_api.assert_not_called()
 
 
@@ -257,11 +267,11 @@ def test_shutdown_interrupts_failed_refresh_retry(artifact_cache, monkeypatch):
     watcher_factory.assert_not_called()
 
 
-def test_cached_reads_and_misses_keep_existing_semantics(artifact_cache):
+def test_cached_reads_do_not_call_kubernetes(artifact_cache):
     ctx = artifact_cache
     assert ctx.get("old").namespace == "old"
-    assert ctx.get("missing") is None
     ctx.list_api.assert_not_called()
+    ctx.lookup_api.assert_not_called()
 
 
 def test_empty_bookmark_preserves_cursor(artifact_cache):
@@ -278,3 +288,121 @@ def test_refresh_ensures_secret_cache_for_new_config(artifact_cache):
     ctx.list_api.return_value = ctx.listing(ctx.item("new"), version="12")
     ctx.cache._refresh_full()
     ctx.ensure_secret_cache.assert_called_once_with()
+
+
+def test_live_lookup_finds_new_resource_without_changing_snapshot(artifact_cache):
+    ctx = artifact_cache
+    ctx.lookup_api.return_value = ctx.listing(ctx.item("new"), version="12")
+    ctx.ensure_secret_cache.reset_mock()
+
+    info = ctx.get("new")
+
+    assert info.namespace == "new"
+    if ctx.kind == "config":
+        assert info.artifact_root_path == "data"
+        assert info.artifact_root_secret == caches.ARTIFACT_CONNECTION_SECRET_NAME
+        ctx.ensure_secret_cache.assert_called_once_with()
+    else:
+        assert info.bucket_uri == "s3://bucket"
+    ctx.lookup_api.assert_called_once_with(**ctx.lookup_kwargs)
+    snapshot = ctx.cache._configs if ctx.kind == "config" else ctx.cache._secrets
+    assert "new" not in snapshot
+    assert ctx.cache._resource_version == "1"
+
+
+def test_live_absence_is_not_negatively_cached(artifact_cache):
+    ctx = artifact_cache
+    ctx.lookup_api.side_effect = [ctx.listing(), ctx.listing(ctx.item("new"), version="12")]
+
+    assert ctx.get("new") is None
+    assert ctx.get("new").namespace == "new"
+    assert ctx.lookup_api.call_count == 2
+    assert ctx.cache._resource_version == "1"
+
+
+@pytest.mark.parametrize(
+    "status,code", [(401, "UNAUTHENTICATED"), (403, "PERMISSION_DENIED"), (503, "INTERNAL_ERROR")]
+)
+def test_live_api_failure_is_not_absence(artifact_cache, status, code):
+    ctx = artifact_cache
+    ctx.lookup_api.side_effect = ApiException(status=status, reason="sensitive details")
+
+    with pytest.raises(MlflowException, match="Failed to verify") as exc:
+        ctx.get("new")
+
+    assert exc.value.error_code == code
+    assert f"HTTP {status}" in exc.value.message
+    assert "sensitive details" not in exc.value.message
+    assert ctx.cache._resource_version == "1"
+    # A targeted lookup must not disable or clear a working cache.
+    assert ctx.get("old").namespace == "old"
+
+
+def test_live_transport_failure_is_not_absence(artifact_cache):
+    ctx = artifact_cache
+    ctx.lookup_api.side_effect = ReadTimeoutError(None, None, "sensitive details")
+
+    with pytest.raises(MlflowException, match="Failed to verify") as exc:
+        ctx.get("new")
+
+    assert exc.value.error_code == "INTERNAL_ERROR"
+    assert "sensitive details" not in exc.value.message
+
+
+def test_live_404_remains_optional_or_absent(artifact_cache):
+    ctx = artifact_cache
+    ctx.lookup_api.side_effect = ApiException(status=404)
+    assert ctx.get("new") is None
+    assert ctx.cache._resource_version == "1"
+
+
+def test_live_lookup_does_not_overwrite_concurrent_watch_update(artifact_cache):
+    ctx = artifact_cache
+
+    def lookup(**kwargs):
+        newer = (
+            config("new", version="13", path="latest")
+            if ctx.kind == "config"
+            else secret("new", version="13", bucket="latest")
+        )
+        ctx.cache._handle_event({"type": "ADDED", "object": newer})
+        return ctx.listing(ctx.item("new"), version="12")
+
+    ctx.lookup_api.side_effect = lookup
+    earlier = ctx.get("new")
+    latest = ctx.get("new")
+
+    if ctx.kind == "config":
+        assert earlier.artifact_root_path == "data"
+        assert latest.artifact_root_path == "latest"
+    else:
+        assert earlier.bucket_uri == "s3://bucket"
+        assert latest.bucket_uri == "s3://latest"
+    assert ctx.cache._resource_version == "13"
+    ctx.lookup_api.assert_called_once()
+
+
+def test_live_lookup_checks_returned_namespace(artifact_cache):
+    ctx = artifact_cache
+    ctx.lookup_api.return_value = ctx.listing(ctx.item("other-team"))
+    assert ctx.get("new") is None
+
+
+@pytest.mark.parametrize("failure", [401, 503, "timeout"])
+def test_request_reload_failure_cannot_silently_select_defaults(monkeypatch, failure):
+    monkeypatch.setattr(caches.threading.Thread, "start", lambda self: None)
+    api = MagicMock()
+    api.list_cluster_custom_object.side_effect = ApiException(status=404)
+    cache = caches.MlflowConfigCache(api)
+    assert not cache._crd_available
+    api.list_cluster_custom_object.side_effect = (
+        ReadTimeoutError(None, None, "sensitive details")
+        if failure == "timeout"
+        else ApiException(status=failure, reason="sensitive details")
+    )
+
+    with pytest.raises(MlflowException, match="Failed to verify") as exc:
+        cache.get_config("new")
+
+    assert exc.value.error_code == ("UNAUTHENTICATED" if failure == 401 else "INTERNAL_ERROR")
+    assert "sensitive details" not in exc.value.message

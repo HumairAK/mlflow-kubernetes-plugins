@@ -34,11 +34,19 @@ and deletions. Workspace listings and cache hits still use the cache and can lag
 Kubernetes until the watch processes events or a relist completes.
 
 MLflowConfig and artifact connection Secret watches use the same timeouts and refresh
-on reconnect. Their lookups remain cache-only (apart from the existing MLflowConfig
-reload when its CRD is unavailable), so storage overrides can lag behind Kubernetes
-until an event is processed or a refresh succeeds. An absent MLflowConfig CRD remains
-optional, and denied Secret access retains the existing unavailable-cache behavior.
-These protections do not require additional RBAC permissions.
+on reconnect. Cache misses also verify the resource with Kubernetes before treating
+an override or Secret as absent. MLflowConfig uses a cluster-scoped list filtered by
+`metadata.namespace`; Secrets use a namespaced list filtered by the shared Secret
+name. These use the existing list permissions, without additional RBAC requirements.
+Live results and misses do not modify the watch snapshot or its resource version, and
+misses are not negatively cached. Cache hits remain local and can lag behind updates
+or deletions until the watch catches up.
+
+An absent MLflowConfig CRD remains optional. Caches already disabled by denied access
+retain their existing retry behavior; the unavailable Secret cache does not perform
+request-triggered reloads. Permission and connectivity failures during a live lookup
+are surfaced as errors. A request-triggered MLflowConfig reload likewise surfaces
+transient API failures rather than silently selecting default storage.
 
 ## Installation
 

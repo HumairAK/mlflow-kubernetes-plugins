@@ -67,6 +67,7 @@ def mock_apis(monkeypatch):
     }
 
     # Default: No artifact connection secrets
+    mock_core.list_namespaced_secret.return_value = SimpleNamespace(items=[])
     mock_core.list_secret_for_all_namespaces.return_value = SimpleNamespace(
         items=[],
         metadata=SimpleNamespace(resource_version="1"),
@@ -876,3 +877,50 @@ def test_secret_cache_handles_missing_bucket_key(monkeypatch):
     info = cache.get_secret("team-a")
     assert info is not None
     assert info.bucket_uri is None
+
+
+def test_resolve_artifact_root_finds_config_and_secret_created_after_initialization(
+    mock_apis, monkeypatch
+):
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.workspace_plugin.caches.threading.Thread.start",
+        lambda self: None,
+    )
+    provider = KubernetesWorkspaceProvider()
+    provider._ensure_secret_cache()
+    mock_apis.custom.list_cluster_custom_object.return_value = {
+        "items": [_mlflow_config("new-team", ARTIFACT_CONNECTION_SECRET_NAME, "evaluations")],
+        "metadata": {"resourceVersion": "12"},
+    }
+    mock_apis.core.list_namespaced_secret.return_value = SimpleNamespace(
+        items=[_secret("new-team", "team-bucket")]
+    )
+
+    assert provider.resolve_artifact_root("s3://default", "new-team") == (
+        "s3://team-bucket/evaluations",
+        False,
+    )
+    assert "new-team" not in provider._mlflow_config_cache._configs
+    assert "new-team" not in provider._secret_cache._secrets
+
+
+@pytest.mark.parametrize("resource", ["config", "secret"])
+def test_resolve_artifact_root_does_not_hide_live_api_failure(mock_apis, monkeypatch, resource):
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.workspace_plugin.caches.threading.Thread.start",
+        lambda self: None,
+    )
+    provider = KubernetesWorkspaceProvider()
+    provider._ensure_secret_cache()
+    if resource == "config":
+        mock_apis.custom.list_cluster_custom_object.side_effect = ApiException(status=503)
+    else:
+        mock_apis.custom.list_cluster_custom_object.return_value = {
+            "items": [_mlflow_config("new-team", ARTIFACT_CONNECTION_SECRET_NAME)],
+            "metadata": {"resourceVersion": "12"},
+        }
+        mock_apis.core.list_namespaced_secret.side_effect = ApiException(status=503)
+
+    with pytest.raises(MlflowException) as exc:
+        provider.resolve_artifact_root("s3://default", "new-team")
+    assert exc.value.error_code == "INTERNAL_ERROR"

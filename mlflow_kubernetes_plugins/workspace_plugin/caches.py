@@ -39,6 +39,22 @@ CACHE_WATCH_SECONDS = 300
 CACHE_WATCH_TIMEOUT = (5, CACHE_WATCH_SECONDS + 30)
 
 
+def _storage_lookup_error(resource: str, namespace: str | None, exc: Exception) -> MlflowException:
+    status = exc.status if isinstance(exc, ApiException) else None
+    code = INTERNAL_ERROR
+    if status == 401:
+        code = UNAUTHENTICATED
+    elif status == 403:
+        code = PERMISSION_DENIED
+    detail = f" (HTTP {status})" if status is not None else ""
+    location = f"in namespace '{namespace}'" if namespace is not None else "across namespaces"
+    return MlflowException(
+        f"Failed to verify {resource} {location}{detail}. "
+        "Check Kubernetes API connectivity and list permissions.",
+        code,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class NamespaceInfo:
     name: str
@@ -314,16 +330,52 @@ class MlflowConfigCache:
         self._retry_event.set()
 
     def get_config(self, namespace: str) -> MlflowConfigInfo | None:
-        """Get MLflowConfig for a namespace, or None if not found."""
+        """Resolve cache misses against Kubernetes before using default storage."""
         self._wait_until_ready()
         with self._lock:
-            if self._crd_available:
-                return self._configs.get(namespace)
-        # CRD was unavailable — attempt a blocking reload outside the lock.
-        if not self._try_reload():
-            return None
-        with self._lock:
-            return self._configs.get(namespace)
+            info = self._configs.get(namespace)
+            available = self._crd_available
+        if info is not None:
+            return info
+        if not available:
+            # Preserve the optional-CRD/denied-access retry path. Transient API
+            # failures during a request must not silently select default storage.
+            if not self._try_reload():
+                return None
+            with self._lock:
+                info = self._configs.get(namespace)
+            if info is not None:
+                return info
+
+        try:
+            response = self._api.list_cluster_custom_object(
+                group=MLFLOW_CONFIG_GROUP,
+                version=MLFLOW_CONFIG_VERSION,
+                plural=MLFLOW_CONFIG_PLURAL,
+                field_selector=f"metadata.namespace={namespace}",
+                _request_timeout=CACHE_REQUEST_TIMEOUT,
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                # This cluster-scoped LIST can return 404 when the optional CRD
+                # has been removed. No namespace-specific GET permission is needed.
+                return None
+            raise _storage_lookup_error("MLflowConfig", namespace, exc) from exc
+        except HTTPError as exc:
+            raise _storage_lookup_error("MLflowConfig", namespace, exc) from exc
+
+        info = None
+        for item in response.get("items", []) or []:
+            candidate = self._extract_info(item)
+            if candidate is not None and candidate.namespace == namespace:
+                # Match the full snapshot's last-entry behavior if a namespace
+                # has more than one MLflowConfig.
+                info = candidate
+        if info is not None and self._uses_artifact_connection_secret(info):
+            self._ensure_secret_cache()
+        # Never write a targeted response into the watch snapshot or advance its
+        # cursor: a concurrent watch event may already be newer.
+        return info
 
     def _wait_until_ready(self) -> None:
         if self._ready_event.wait(timeout=30):
@@ -336,13 +388,13 @@ class MlflowConfigCache:
     def _try_reload(self) -> bool:
         """Attempt an immediate reload when the CRD was previously unavailable."""
         _logger.debug("MLflowConfig CRD unavailable; attempting immediate reload")
-        self._refresh_full()
+        self._refresh_full(raise_on_error=True)
         # Wake the background thread so it transitions from the retry-sleep
         # into the active watch loop if the CRD is now available.
         self._retry_event.set()
         return self._crd_available
 
-    def _refresh_full(self) -> bool:
+    def _refresh_full(self, *, raise_on_error: bool = False) -> bool:
         try:
             response = self._api.list_cluster_custom_object(
                 group=MLFLOW_CONFIG_GROUP,
@@ -373,10 +425,14 @@ class MlflowConfigCache:
                     self._configs.clear()
                     self._resource_version = None
             else:
+                if raise_on_error:
+                    raise _storage_lookup_error("MLflowConfig", None, exc) from exc
                 _logger.warning(f"Failed to list MLflowConfig CRDs: {exc}")
             self._ready_event.set()
             return False
-        except Exception:
+        except Exception as exc:
+            if raise_on_error:
+                raise _storage_lookup_error("MLflowConfig", None, exc) from exc
             _logger.warning("Unexpected error listing MLflowConfig CRDs", exc_info=True)
             self._ready_event.set()
             return False
@@ -588,7 +644,31 @@ class SecretCache:
         with self._lock:
             if not self._available:
                 return None
-            return self._secrets.get(namespace)
+            info = self._secrets.get(namespace)
+        if info is not None:
+            return info
+
+        try:
+            response = self._api.list_namespaced_secret(
+                namespace=namespace,
+                field_selector=f"metadata.name={ARTIFACT_CONNECTION_SECRET_NAME}",
+                watch=False,
+                _request_timeout=CACHE_REQUEST_TIMEOUT,
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                # The namespace itself may have been deleted since resolution.
+                return None
+            raise _storage_lookup_error("artifact connection Secret", namespace, exc) from exc
+        except HTTPError as exc:
+            raise _storage_lookup_error("artifact connection Secret", namespace, exc) from exc
+
+        for secret in response.items or []:
+            info = self._extract_info(secret)
+            if info is not None and info.namespace == namespace:
+                # Leave the snapshot and resource version to the watch thread.
+                return info
+        return None
 
     def _wait_until_ready(self) -> None:
         if self._ready_event.wait(timeout=30):
