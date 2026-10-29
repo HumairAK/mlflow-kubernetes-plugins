@@ -31,8 +31,14 @@ Namespace watches request a 300-second server-side duration and use a 330-second
 read timeout so a stalled stream can reconnect. After a watch ends or fails, the worker
 relists namespaces before starting a new watch, repairing missed additions, changes,
 and deletions. Workspace listings and cache hits still use the cache and can lag behind
-Kubernetes until the watch processes events or a relist completes. The other caches
-(MLflowConfig and artifact connection Secrets) are unchanged.
+Kubernetes until the watch processes events or a relist completes.
+
+MLflowConfig and artifact connection Secret watches use the same timeouts and refresh
+on reconnect. Their lookups remain cache-only (apart from the existing MLflowConfig
+reload when its CRD is unavailable), so storage overrides can lag behind Kubernetes
+until an event is processed or a refresh succeeds. An absent MLflowConfig CRD remains
+optional, and denied Secret access retains the existing unavailable-cache behavior.
+These protections do not require additional RBAC permissions.
 
 ## Installation
 
