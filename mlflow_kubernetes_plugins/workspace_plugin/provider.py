@@ -25,6 +25,7 @@ from mlflow.utils.uri import append_to_uri_path
 from mlflow_kubernetes_plugins.workspace_plugin.caches import (
     ARTIFACT_CONNECTION_SECRET_NAME,
     MlflowConfigCache,
+    MlflowConfigInfo,
     NamespaceCache,
     SecretCache,
 )
@@ -136,11 +137,14 @@ class KubernetesWorkspaceProvider(AbstractStore):
 
     def list_workspaces(self) -> Iterable[Workspace]:  # type: ignore[override]
         infos = self._namespace_cache.list_namespaces()
+        configs = self._mlflow_config_cache.get_configs(info.name for info in infos)
         return [
             Workspace(
                 name=info.name,
                 description=info.description,
-                default_artifact_root=self._resolve_workspace_artifact_root(info.name),
+                default_artifact_root=self._resolve_workspace_artifact_root(
+                    info.name, configs=configs
+                ),
             )
             for info in infos
         ]
@@ -183,10 +187,17 @@ class KubernetesWorkspaceProvider(AbstractStore):
             )
         return self.get_workspace(self._config.default_workspace)
 
-    def _resolve_workspace_artifact_root(self, workspace_name: str) -> str | None:
+    def _resolve_workspace_artifact_root(
+        self, workspace_name: str, *, configs: dict[str, MlflowConfigInfo] | None = None
+    ) -> str | None:
         """Best-effort resolution of the per-workspace artifact root."""
         try:
-            root, should_append = self.resolve_artifact_root(None, workspace_name)
+            if configs is None:
+                root, should_append = self.resolve_artifact_root(None, workspace_name)
+            else:
+                root, should_append = self._resolve_artifact_root_from_config(
+                    None, workspace_name, configs.get(workspace_name)
+                )
         except MlflowException as exc:
             if exc.error_code == databricks_pb2.ErrorCode.Name(INVALID_PARAMETER_VALUE):
                 _logger.warning(
@@ -217,6 +228,16 @@ class KubernetesWorkspaceProvider(AbstractStore):
             return default_artifact_root, True
 
         mlflow_config = self._mlflow_config_cache.get_config(workspace_name)
+        return self._resolve_artifact_root_from_config(
+            default_artifact_root, workspace_name, mlflow_config
+        )
+
+    def _resolve_artifact_root_from_config(
+        self,
+        default_artifact_root: str | None,
+        workspace_name: str,
+        mlflow_config: MlflowConfigInfo | None,
+    ) -> tuple[str | None, bool]:
         if not mlflow_config or not mlflow_config.artifact_root_secret:
             # No override configured - use default behavior
             return default_artifact_root, True

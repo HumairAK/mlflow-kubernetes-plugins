@@ -4,10 +4,10 @@ import base64
 import binascii
 import logging
 import threading
-import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
+from typing import cast
 
 from kubernetes import watch
 from kubernetes.client import CoreV1Api, CustomObjectsApi
@@ -34,9 +34,25 @@ ARTIFACT_CONNECTION_SECRET_NAME = "mlflow-artifact-connection"
 
 # Bound both connection establishment and idle reads. The watch read timeout
 # exceeds the server-side duration so an idle stream normally closes cleanly.
-NAMESPACE_REQUEST_TIMEOUT = (5, 30)
-NAMESPACE_WATCH_SECONDS = 300
-NAMESPACE_WATCH_TIMEOUT = (5, NAMESPACE_WATCH_SECONDS + 30)
+CACHE_REQUEST_TIMEOUT = (5, 30)
+CACHE_WATCH_SECONDS = 300
+CACHE_WATCH_TIMEOUT = (5, CACHE_WATCH_SECONDS + 30)
+
+
+def _storage_lookup_error(resource: str, namespace: str | None, exc: Exception) -> MlflowException:
+    status = exc.status if isinstance(exc, ApiException) else None
+    code = INTERNAL_ERROR
+    if status == 401:
+        code = UNAUTHENTICATED
+    elif status == 403:
+        code = PERMISSION_DENIED
+    detail = f" (HTTP {status})" if status is not None else ""
+    location = f"in namespace '{namespace}'" if namespace is not None else "across namespaces"
+    return MlflowException(
+        f"Failed to verify {resource} {location}{detail}. "
+        "Check Kubernetes API connectivity and list permissions.",
+        code,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,7 +123,7 @@ class NamespaceCache:
                 field_selector=f"metadata.name={name}",
                 label_selector=self._label_selector,
                 watch=False,
-                _request_timeout=NAMESPACE_REQUEST_TIMEOUT,
+                _request_timeout=CACHE_REQUEST_TIMEOUT,
             )
         except ApiException as exc:
             code = {401: UNAUTHENTICATED, 403: PERMISSION_DENIED}.get(exc.status, INTERNAL_ERROR)
@@ -148,7 +164,7 @@ class NamespaceCache:
             response = self._api.list_namespace(
                 label_selector=self._label_selector,
                 watch=False,
-                _request_timeout=NAMESPACE_REQUEST_TIMEOUT,
+                _request_timeout=CACHE_REQUEST_TIMEOUT,
             )
         except ApiException as exc:  # pragma: no cover - depends on live cluster
             raise MlflowException(
@@ -188,8 +204,8 @@ class NamespaceCache:
                     self._api.list_namespace,
                     label_selector=self._label_selector,
                     resource_version=self._resource_version,
-                    timeout_seconds=NAMESPACE_WATCH_SECONDS,
-                    _request_timeout=NAMESPACE_WATCH_TIMEOUT,
+                    timeout_seconds=CACHE_WATCH_SECONDS,
+                    _request_timeout=CACHE_WATCH_TIMEOUT,
                 ):
                     if self._stop_event.is_set():
                         watcher.stop()
@@ -314,16 +330,75 @@ class MlflowConfigCache:
         self._retry_event.set()
 
     def get_config(self, namespace: str) -> MlflowConfigInfo | None:
-        """Get MLflowConfig for a namespace, or None if not found."""
+        """Resolve cache misses against Kubernetes before using default storage."""
         self._wait_until_ready()
         with self._lock:
-            if self._crd_available:
-                return self._configs.get(namespace)
-        # CRD was unavailable — attempt a blocking reload outside the lock.
-        if not self._try_reload():
-            return None
+            info = self._configs.get(namespace)
+            available = self._crd_available
+        if info is not None:
+            return info
+        if not available:
+            # Preserve the optional-CRD/denied-access retry path. Transient API
+            # failures during a request must not silently select default storage.
+            if not self._try_reload():
+                return None
+            with self._lock:
+                info = self._configs.get(namespace)
+            if info is not None:
+                return info
+
+        info = self._lookup_configs(namespace).get(namespace)
+        if info is not None and self._uses_artifact_connection_secret(info):
+            self._ensure_secret_cache()
+        return info
+
+    def get_configs(self, namespaces: Iterable[str]) -> dict[str, MlflowConfigInfo]:
+        """Verify misses once for a listing, without changing the watch snapshot."""
+        self._wait_until_ready()
+        requested = set(namespaces)
         with self._lock:
-            return self._configs.get(namespace)
+            configs = {name: info for name, info in self._configs.items() if name in requested}
+            available = self._crd_available
+        if requested.issubset(configs):
+            return configs
+        if not available:
+            # The existing optional-CRD reload already verifies the full set.
+            if not self._try_reload():
+                return {}
+            with self._lock:
+                return {name: info for name, info in self._configs.items() if name in requested}
+
+        configs = {name: info for name, info in self._lookup_configs().items() if name in requested}
+        if any(self._uses_artifact_connection_secret(info) for info in configs.values()):
+            self._ensure_secret_cache()
+        return configs
+
+    def _lookup_configs(self, namespace: str | None = None) -> dict[str, MlflowConfigInfo]:
+        try:
+            response = self._api.list_cluster_custom_object(
+                group=MLFLOW_CONFIG_GROUP,
+                version=MLFLOW_CONFIG_VERSION,
+                plural=MLFLOW_CONFIG_PLURAL,
+                field_selector=f"metadata.namespace={namespace}" if namespace is not None else None,
+                _request_timeout=CACHE_REQUEST_TIMEOUT,
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                # A cluster-scoped LIST returns 404 when the optional CRD is absent.
+                return {}
+            raise _storage_lookup_error("MLflowConfig", namespace, exc) from exc
+        except HTTPError as exc:
+            raise _storage_lookup_error("MLflowConfig", namespace, exc) from exc
+
+        configs: dict[str, MlflowConfigInfo] = {}
+        for item in response.get("items", []) or []:
+            info = self._extract_info(item)
+            if info is not None and (namespace is None or info.namespace == namespace):
+                # Preserve the full snapshot's last-entry behavior per namespace.
+                configs[info.namespace] = info
+        # Request-local results must not overwrite newer watch updates or move
+        # the collection cursor. Absence is verified again on the next request.
+        return configs
 
     def _wait_until_ready(self) -> None:
         if self._ready_event.wait(timeout=30):
@@ -336,18 +411,19 @@ class MlflowConfigCache:
     def _try_reload(self) -> bool:
         """Attempt an immediate reload when the CRD was previously unavailable."""
         _logger.debug("MLflowConfig CRD unavailable; attempting immediate reload")
-        self._refresh_full()
+        self._refresh_full(raise_on_error=True)
         # Wake the background thread so it transitions from the retry-sleep
         # into the active watch loop if the CRD is now available.
         self._retry_event.set()
         return self._crd_available
 
-    def _refresh_full(self) -> None:
+    def _refresh_full(self, *, raise_on_error: bool = False) -> bool:
         try:
             response = self._api.list_cluster_custom_object(
                 group=MLFLOW_CONFIG_GROUP,
                 version=MLFLOW_CONFIG_VERSION,
                 plural=MLFLOW_CONFIG_PLURAL,
+                _request_timeout=CACHE_REQUEST_TIMEOUT,
             )
         except ApiException as exc:
             if exc.status == 404:
@@ -372,13 +448,17 @@ class MlflowConfigCache:
                     self._configs.clear()
                     self._resource_version = None
             else:
+                if raise_on_error:
+                    raise _storage_lookup_error("MLflowConfig", None, exc) from exc
                 _logger.warning(f"Failed to list MLflowConfig CRDs: {exc}")
             self._ready_event.set()
-            return
-        except Exception:
+            return False
+        except Exception as exc:
+            if raise_on_error:
+                raise _storage_lookup_error("MLflowConfig", None, exc) from exc
             _logger.warning("Unexpected error listing MLflowConfig CRDs", exc_info=True)
             self._ready_event.set()
-            return
+            return False
 
         items = response.get("items", [])
         metadata = response.get("metadata", {})
@@ -400,6 +480,7 @@ class MlflowConfigCache:
         if should_ensure_secret_cache:
             self._ensure_secret_cache()
         self._ready_event.set()
+        return True
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
@@ -418,10 +499,12 @@ class MlflowConfigCache:
 
             if self._resource_version is None:
                 try:
-                    self._refresh_full()
+                    if not self._refresh_full():
+                        self._stop_event.wait(2)
+                        continue
                 except Exception:
                     _logger.warning("Failed to refresh MLflowConfig; retrying", exc_info=True)
-                    time.sleep(2)
+                    self._stop_event.wait(2)
                     continue
 
             # Skip watch if CRD became unavailable during refresh
@@ -436,12 +519,15 @@ class MlflowConfigCache:
                     version=MLFLOW_CONFIG_VERSION,
                     plural=MLFLOW_CONFIG_PLURAL,
                     resource_version=self._resource_version,
-                    timeout_seconds=300,
+                    timeout_seconds=CACHE_WATCH_SECONDS,
+                    _request_timeout=CACHE_WATCH_TIMEOUT,
                 ):
                     if self._stop_event.is_set():
                         watcher.stop()
                         break
                     self._handle_event(event)
+                    if self._resource_version is None:
+                        break
             except ApiException as exc:
                 if exc.status == 410:
                     _logger.debug("MLflowConfig watch expired; resyncing")
@@ -454,16 +540,37 @@ class MlflowConfigCache:
                         self._resource_version = None
                 else:
                     _logger.warning("MLflowConfig watch error: %s", exc)
-                    time.sleep(2)
+                    self._stop_event.wait(2)
             except Exception:
                 _logger.exception("Unexpected error in MLflowConfig watch loop")
-                time.sleep(2)
+                self._stop_event.wait(2)
             else:
-                time.sleep(1)
+                self._stop_event.wait(1)
+            finally:
+                watcher.stop()
+                # Rebuild the snapshot before reconnecting to repair missed events.
+                self._resource_version = None
 
     def _handle_event(self, event: dict[str, object]) -> None:
         event_type = event.get("type")
         obj = event.get("object")
+        if event_type == "ERROR":
+            with self._lock:
+                self._resource_version = None
+            return
+        if event_type == "BOOKMARK":
+            metadata = (
+                cast(dict[str, object], obj).get("metadata") if isinstance(obj, dict) else None
+            )
+            resource_version = (
+                cast(dict[str, object], metadata).get("resourceVersion")
+                if isinstance(metadata, dict)
+                else None
+            )
+            if isinstance(resource_version, str) and resource_version:
+                with self._lock:
+                    self._resource_version = resource_version
+            return
         if not isinstance(obj, dict):
             return
         metadata = obj.get("metadata")
@@ -485,10 +592,6 @@ class MlflowConfigCache:
             elif event_type == "DELETED":
                 self._configs.pop(namespace, None)
                 self._resource_version = resource_version
-            elif event_type == "BOOKMARK":
-                self._resource_version = resource_version or self._resource_version
-            elif event_type == "ERROR":
-                self._resource_version = None
             else:
                 # Unknown event type; trigger a resync.
                 self._resource_version = None
@@ -564,7 +667,31 @@ class SecretCache:
         with self._lock:
             if not self._available:
                 return None
-            return self._secrets.get(namespace)
+            info = self._secrets.get(namespace)
+        if info is not None:
+            return info
+
+        try:
+            response = self._api.list_namespaced_secret(
+                namespace=namespace,
+                field_selector=f"metadata.name={ARTIFACT_CONNECTION_SECRET_NAME}",
+                watch=False,
+                _request_timeout=CACHE_REQUEST_TIMEOUT,
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                # The namespace itself may have been deleted since resolution.
+                return None
+            raise _storage_lookup_error("artifact connection Secret", namespace, exc) from exc
+        except HTTPError as exc:
+            raise _storage_lookup_error("artifact connection Secret", namespace, exc) from exc
+
+        for secret in response.items or []:
+            info = self._extract_info(secret)
+            if info is not None and info.namespace == namespace:
+                # Leave the snapshot and resource version to the watch thread.
+                return info
+        return None
 
     def _wait_until_ready(self) -> None:
         if self._ready_event.wait(timeout=30):
@@ -580,6 +707,7 @@ class SecretCache:
             response = self._api.list_secret_for_all_namespaces(
                 field_selector=f"metadata.name={ARTIFACT_CONNECTION_SECRET_NAME}",
                 watch=False,
+                _request_timeout=CACHE_REQUEST_TIMEOUT,
             )
         except ApiException as exc:
             if exc.status == 403:
@@ -595,10 +723,9 @@ class SecretCache:
                     self._resource_version = None
                 self._ready_event.set()
                 return
-            raise MlflowException(
-                f"Failed to list Kubernetes secrets: {exc}",
-                INTERNAL_ERROR,
-            ) from exc
+            raise _storage_lookup_error("artifact connection Secrets", None, exc) from exc
+        except HTTPError as exc:
+            raise _storage_lookup_error("artifact connection Secrets", None, exc) from exc
 
         items = getattr(response, "items", []) or []
         metadata = getattr(response, "metadata", None)
@@ -615,7 +742,7 @@ class SecretCache:
 
         self._ready_event.set()
 
-    def _run(self) -> None:  # pragma: no cover - background thread
+    def _run(self) -> None:
         while not self._stop_event.is_set():
             if not self._available:
                 self._retry_event.wait(timeout=300)
@@ -633,7 +760,7 @@ class SecretCache:
                     self._refresh_full()
                 except Exception:
                     _logger.warning("Failed to refresh secrets; retrying shortly", exc_info=True)
-                    time.sleep(2)
+                    self._stop_event.wait(2)
                     continue
 
             if not self._available:
@@ -645,12 +772,15 @@ class SecretCache:
                     self._api.list_secret_for_all_namespaces,
                     field_selector=f"metadata.name={ARTIFACT_CONNECTION_SECRET_NAME}",
                     resource_version=self._resource_version,
-                    timeout_seconds=300,
+                    timeout_seconds=CACHE_WATCH_SECONDS,
+                    _request_timeout=CACHE_WATCH_TIMEOUT,
                 ):
                     if self._stop_event.is_set():
                         watcher.stop()
                         break
                     self._handle_event(event)
+                    if self._resource_version is None:
+                        break
             except ApiException as exc:
                 if exc.status == 410:
                     _logger.debug("Secret watch resource version expired; resyncing.")
@@ -662,16 +792,39 @@ class SecretCache:
                         self._resource_version = None
                 else:
                     _logger.warning("Secret watch error: %s", exc)
-                    time.sleep(2)
+                    self._stop_event.wait(2)
             except Exception:
                 _logger.exception("Unexpected error in secret watch loop")
-                time.sleep(2)
+                self._stop_event.wait(2)
             else:
-                time.sleep(1)
+                self._stop_event.wait(1)
+            finally:
+                watcher.stop()
+                # Rebuild the snapshot before reconnecting to repair missed events.
+                self._resource_version = None
 
     def _handle_event(self, event: dict[str, object]) -> None:
         event_type = event.get("type")
         obj = event.get("object")
+        if event_type == "ERROR":
+            with self._lock:
+                self._resource_version = None
+            return
+        if event_type == "BOOKMARK":
+            if isinstance(obj, dict):
+                metadata = cast(dict[str, object], obj).get("metadata")
+                resource_version = (
+                    cast(dict[str, object], metadata).get("resourceVersion")
+                    if isinstance(metadata, dict)
+                    else None
+                )
+            else:
+                metadata = getattr(obj, "metadata", None)
+                resource_version = getattr(metadata, "resource_version", None)
+            if isinstance(resource_version, str) and resource_version:
+                with self._lock:
+                    self._resource_version = resource_version
+            return
         if not obj:
             return
 
@@ -693,11 +846,6 @@ class SecretCache:
             elif event_type == "DELETED":
                 self._secrets.pop(namespace, None)
                 self._resource_version = resource_version
-            elif event_type == "BOOKMARK":
-                self._resource_version = resource_version or self._resource_version
-            elif event_type == "ERROR":
-                self._resource_version = None
-                return
             else:
                 self._resource_version = None
                 return

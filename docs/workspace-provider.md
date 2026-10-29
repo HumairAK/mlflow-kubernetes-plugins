@@ -31,8 +31,27 @@ Namespace watches request a 300-second server-side duration and use a 330-second
 read timeout so a stalled stream can reconnect. After a watch ends or fails, the worker
 relists namespaces before starting a new watch, repairing missed additions, changes,
 and deletions. Workspace listings and cache hits still use the cache and can lag behind
-Kubernetes until the watch processes events or a relist completes. The other caches
-(MLflowConfig and artifact connection Secrets) are unchanged.
+Kubernetes until the watch processes events or a relist completes.
+
+MLflowConfig and artifact connection Secret watches use the same timeouts and refresh
+on reconnect. Cache misses also verify the resource with Kubernetes before treating
+an override or Secret as absent. MLflowConfig uses a cluster-scoped list filtered by
+`metadata.namespace`; Secrets use a namespaced list filtered by the shared Secret
+name. These use the existing list permissions, without additional RBAC requirements.
+Live results and misses do not modify the watch snapshot or its resource version, and
+misses are not negatively cached. Workspace listings verify missing MLflowConfigs in
+one batch and use that request-local snapshot for artifact root resolution, avoiding
+one API request per workspace with no override. Individual lookups retain their
+targeted verification. Cache hits remain local and can lag behind updates
+or deletions until the watch catches up.
+
+An absent MLflowConfig CRD remains optional. Caches already disabled by denied access
+retain their existing retry behavior; the unavailable Secret cache does not perform
+request-triggered reloads. Permission and connectivity failures during a live lookup
+are surfaced as errors. A request-triggered MLflowConfig reload likewise surfaces
+transient API failures rather than silently selecting default storage. Initial Secret
+cache loading uses the same normalized errors, including when the first override
+lookup lazily starts that cache.
 
 ## Installation
 
