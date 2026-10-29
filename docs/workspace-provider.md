@@ -39,14 +39,19 @@ an override or Secret as absent. MLflowConfig uses a cluster-scoped list filtere
 `metadata.namespace`; Secrets use a namespaced list filtered by the shared Secret
 name. These use the existing list permissions, without additional RBAC requirements.
 Live results and misses do not modify the watch snapshot or its resource version, and
-misses are not negatively cached. Cache hits remain local and can lag behind updates
+misses are not negatively cached. Workspace listings verify missing MLflowConfigs in
+one batch and use that request-local snapshot for artifact root resolution, avoiding
+one API request per workspace with no override. Individual lookups retain their
+targeted verification. Cache hits remain local and can lag behind updates
 or deletions until the watch catches up.
 
 An absent MLflowConfig CRD remains optional. Caches already disabled by denied access
 retain their existing retry behavior; the unavailable Secret cache does not perform
 request-triggered reloads. Permission and connectivity failures during a live lookup
 are surfaced as errors. A request-triggered MLflowConfig reload likewise surfaces
-transient API failures rather than silently selecting default storage.
+transient API failures rather than silently selecting default storage. Initial Secret
+cache loading uses the same normalized errors, including when the first override
+lookup lazily starts that cache.
 
 ## Installation
 

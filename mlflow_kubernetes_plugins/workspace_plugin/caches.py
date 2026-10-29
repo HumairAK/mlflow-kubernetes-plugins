@@ -4,7 +4,7 @@ import base64
 import binascii
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import cast
@@ -347,35 +347,58 @@ class MlflowConfigCache:
             if info is not None:
                 return info
 
+        info = self._lookup_configs(namespace).get(namespace)
+        if info is not None and self._uses_artifact_connection_secret(info):
+            self._ensure_secret_cache()
+        return info
+
+    def get_configs(self, namespaces: Iterable[str]) -> dict[str, MlflowConfigInfo]:
+        """Verify misses once for a listing, without changing the watch snapshot."""
+        self._wait_until_ready()
+        requested = set(namespaces)
+        with self._lock:
+            configs = {name: info for name, info in self._configs.items() if name in requested}
+            available = self._crd_available
+        if requested.issubset(configs):
+            return configs
+        if not available:
+            # The existing optional-CRD reload already verifies the full set.
+            if not self._try_reload():
+                return {}
+            with self._lock:
+                return {name: info for name, info in self._configs.items() if name in requested}
+
+        configs = {name: info for name, info in self._lookup_configs().items() if name in requested}
+        if any(self._uses_artifact_connection_secret(info) for info in configs.values()):
+            self._ensure_secret_cache()
+        return configs
+
+    def _lookup_configs(self, namespace: str | None = None) -> dict[str, MlflowConfigInfo]:
         try:
             response = self._api.list_cluster_custom_object(
                 group=MLFLOW_CONFIG_GROUP,
                 version=MLFLOW_CONFIG_VERSION,
                 plural=MLFLOW_CONFIG_PLURAL,
-                field_selector=f"metadata.namespace={namespace}",
+                field_selector=f"metadata.namespace={namespace}" if namespace is not None else None,
                 _request_timeout=CACHE_REQUEST_TIMEOUT,
             )
         except ApiException as exc:
             if exc.status == 404:
-                # This cluster-scoped LIST can return 404 when the optional CRD
-                # has been removed. No namespace-specific GET permission is needed.
-                return None
+                # A cluster-scoped LIST returns 404 when the optional CRD is absent.
+                return {}
             raise _storage_lookup_error("MLflowConfig", namespace, exc) from exc
         except HTTPError as exc:
             raise _storage_lookup_error("MLflowConfig", namespace, exc) from exc
 
-        info = None
+        configs: dict[str, MlflowConfigInfo] = {}
         for item in response.get("items", []) or []:
-            candidate = self._extract_info(item)
-            if candidate is not None and candidate.namespace == namespace:
-                # Match the full snapshot's last-entry behavior if a namespace
-                # has more than one MLflowConfig.
-                info = candidate
-        if info is not None and self._uses_artifact_connection_secret(info):
-            self._ensure_secret_cache()
-        # Never write a targeted response into the watch snapshot or advance its
-        # cursor: a concurrent watch event may already be newer.
-        return info
+            info = self._extract_info(item)
+            if info is not None and (namespace is None or info.namespace == namespace):
+                # Preserve the full snapshot's last-entry behavior per namespace.
+                configs[info.namespace] = info
+        # Request-local results must not overwrite newer watch updates or move
+        # the collection cursor. Absence is verified again on the next request.
+        return configs
 
     def _wait_until_ready(self) -> None:
         if self._ready_event.wait(timeout=30):
@@ -700,10 +723,9 @@ class SecretCache:
                     self._resource_version = None
                 self._ready_event.set()
                 return
-            raise MlflowException(
-                f"Failed to list Kubernetes secrets: {exc}",
-                INTERNAL_ERROR,
-            ) from exc
+            raise _storage_lookup_error("artifact connection Secrets", None, exc) from exc
+        except HTTPError as exc:
+            raise _storage_lookup_error("artifact connection Secrets", None, exc) from exc
 
         items = getattr(response, "items", []) or []
         metadata = getattr(response, "metadata", None)

@@ -16,6 +16,7 @@ from mlflow_kubernetes_plugins.workspace_plugin.provider import (
     KubernetesWorkspaceProvider,
     create_kubernetes_workspace_store,
 )
+from urllib3.exceptions import ReadTimeoutError
 
 
 @pytest.fixture(autouse=True)
@@ -623,7 +624,7 @@ def test_secret_cache_raises_on_transient_error(mock_apis):
     }
     mock_apis.core.list_secret_for_all_namespaces.side_effect = ApiException(status=500)
 
-    with pytest.raises(MlflowException, match="Failed to list Kubernetes secrets"):
+    with pytest.raises(MlflowException, match="Failed to verify artifact connection Secrets"):
         KubernetesWorkspaceProvider()
 
 
@@ -924,3 +925,171 @@ def test_resolve_artifact_root_does_not_hide_live_api_failure(mock_apis, monkeyp
     with pytest.raises(MlflowException) as exc:
         provider.resolve_artifact_root("s3://default", "new-team")
     assert exc.value.error_code == "INTERNAL_ERROR"
+
+
+@pytest.fixture
+def listing_provider(mock_apis, monkeypatch):
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.workspace_plugin.caches.threading.Thread.start",
+        lambda self: None,
+    )
+    mock_apis.core.list_namespace.return_value = SimpleNamespace(
+        items=[_namespace(f"team-{i}") for i in range(3)],
+        metadata=SimpleNamespace(resource_version="1"),
+    )
+    provider = KubernetesWorkspaceProvider()
+    mock_apis.custom.list_cluster_custom_object.reset_mock()
+    return provider
+
+
+def test_workspace_listing_batches_absent_configs_per_request(mock_apis, listing_provider):
+    provider = listing_provider
+    api = mock_apis.custom.list_cluster_custom_object
+
+    first = provider.list_workspaces()
+    assert len(first) == 3
+    assert all(ws.default_artifact_root is None for ws in first)
+    api.assert_called_once_with(
+        group="mlflow.kubeflow.org",
+        version="v1",
+        plural="mlflowconfigs",
+        field_selector=None,
+        _request_timeout=(5, 30),
+    )
+    provider.list_workspaces()
+    assert api.call_count == 2
+    assert provider._mlflow_config_cache._configs == {}
+    assert provider._mlflow_config_cache._resource_version == "1"
+
+
+def test_workspace_listing_picks_up_config_after_verified_absence(mock_apis, listing_provider):
+    provider = listing_provider
+    provider.list_workspaces()
+    mock_apis.custom.list_cluster_custom_object.return_value = {
+        "items": [_mlflow_config("team-1", ARTIFACT_CONNECTION_SECRET_NAME, "evaluations")],
+        "metadata": {"resourceVersion": "12"},
+    }
+    mock_apis.core.list_secret_for_all_namespaces.return_value = SimpleNamespace(
+        items=[_secret("team-1", "team-bucket")],
+        metadata=SimpleNamespace(resource_version="12"),
+    )
+
+    workspaces = provider.list_workspaces()
+
+    assert [ws.default_artifact_root for ws in workspaces] == [
+        None,
+        "s3://team-bucket/evaluations",
+        None,
+    ]
+    assert mock_apis.custom.list_cluster_custom_object.call_count == 2
+    assert provider._mlflow_config_cache._configs == {}
+    assert provider._mlflow_config_cache._resource_version == "1"
+    # A separate request still performs a targeted verification.
+    assert provider.resolve_artifact_root("s3://default", "team-1") == (
+        "s3://team-bucket/evaluations",
+        False,
+    )
+    assert mock_apis.custom.list_cluster_custom_object.call_args.kwargs["field_selector"] == (
+        "metadata.namespace=team-1"
+    )
+
+
+def test_workspace_listing_keeps_all_cached_configs_local(mock_apis, listing_provider):
+    provider = listing_provider
+    mock_apis.custom.list_cluster_custom_object.return_value = {
+        "items": [_mlflow_config(f"team-{i}", ARTIFACT_CONNECTION_SECRET_NAME) for i in range(3)],
+        "metadata": {"resourceVersion": "12"},
+    }
+    mock_apis.core.list_secret_for_all_namespaces.return_value = SimpleNamespace(
+        items=[_secret(f"team-{i}", f"bucket-{i}") for i in range(3)],
+        metadata=SimpleNamespace(resource_version="12"),
+    )
+    provider._mlflow_config_cache._refresh_full()
+    mock_apis.custom.list_cluster_custom_object.reset_mock()
+
+    assert [ws.default_artifact_root for ws in provider.list_workspaces()] == [
+        "s3://bucket-0",
+        "s3://bucket-1",
+        "s3://bucket-2",
+    ]
+    mock_apis.custom.list_cluster_custom_object.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "failure,code",
+    [
+        (401, "UNAUTHENTICATED"),
+        (403, "PERMISSION_DENIED"),
+        (503, "INTERNAL_ERROR"),
+        ("timeout", "INTERNAL_ERROR"),
+    ],
+)
+def test_workspace_listing_does_not_hide_batch_lookup_errors(
+    mock_apis, listing_provider, failure, code
+):
+    mock_apis.custom.list_cluster_custom_object.side_effect = (
+        ReadTimeoutError(None, None, "sensitive details")
+        if failure == "timeout"
+        else ApiException(status=failure, reason="sensitive details")
+    )
+    with pytest.raises(MlflowException) as exc:
+        listing_provider.list_workspaces()
+    assert exc.value.error_code == code
+    assert "sensitive details" not in exc.value.message
+    mock_apis.custom.list_cluster_custom_object.assert_called_once()
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_workspace_listing_retains_optional_disabled_config_behavior(
+    mock_apis, listing_provider, status
+):
+    mock_apis.custom.list_cluster_custom_object.side_effect = ApiException(status=status)
+    listing_provider._mlflow_config_cache._refresh_full()
+    mock_apis.custom.list_cluster_custom_object.reset_mock()
+
+    assert all(ws.default_artifact_root is None for ws in listing_provider.list_workspaces())
+    mock_apis.custom.list_cluster_custom_object.assert_called_once()
+
+
+def test_workspace_listing_skips_config_verification_when_empty(mock_apis, listing_provider):
+    listing_provider._namespace_cache._namespaces.clear()
+    assert listing_provider.list_workspaces() == []
+    mock_apis.custom.list_cluster_custom_object.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "failure,code",
+    [(401, "UNAUTHENTICATED"), (503, "INTERNAL_ERROR"), ("timeout", "INTERNAL_ERROR")],
+)
+def test_first_override_normalizes_secret_initialization_errors(
+    mock_apis, listing_provider, failure, code
+):
+    provider = listing_provider
+    assert provider._secret_cache is None
+    mock_apis.custom.list_cluster_custom_object.return_value = {
+        "items": [_mlflow_config("team-0", ARTIFACT_CONNECTION_SECRET_NAME)],
+        "metadata": {"resourceVersion": "12"},
+    }
+    error = (
+        ReadTimeoutError(None, None, "sensitive details")
+        if failure == "timeout"
+        else ApiException(status=failure, reason="sensitive details")
+    )
+    if isinstance(error, ApiException):
+        error.body = "sensitive API response body"
+    mock_apis.core.list_secret_for_all_namespaces.side_effect = error
+
+    with pytest.raises(MlflowException) as exc:
+        provider.resolve_artifact_root("s3://default", "team-0")
+    assert exc.value.error_code == code
+    assert "sensitive" not in exc.value.message
+    assert provider._secret_cache is None
+    mock_apis.core.list_secret_for_all_namespaces.assert_called_once()
+    mock_apis.core.list_namespaced_secret.assert_not_called()
+
+    # Failed lazy initialization must not prevent the next request from recovering.
+    mock_apis.core.list_secret_for_all_namespaces.side_effect = None
+    mock_apis.core.list_secret_for_all_namespaces.return_value = SimpleNamespace(
+        items=[_secret("team-0", "recovered")], metadata=SimpleNamespace(resource_version="12")
+    )
+    assert provider.resolve_artifact_root("s3://default", "team-0") == ("s3://recovered", False)
