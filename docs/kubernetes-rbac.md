@@ -67,11 +67,69 @@ This is most useful for single-object operations such as:
 - creating or updating model versions, webhooks, and many gateway resources by name
 - reading artifacts or trace details that resolve back to one experiment
 
-Collection endpoints behave differently:
+### Collection Permissions in v1
 
-- many search and list endpoints now filter request inputs or response items down to the readable experiments
-- MCP registry collection responses filter server and binding items down to the readable MCP servers
-- some endpoints still require broader `list` access and may return `Permission denied` for callers that only have named resources
+Existing collection policies remain supported on `release-v1`:
+
+- experiment search responses are filtered by named `get` on `experiments`
+- registered-model and model-version search responses are filtered by named `get` on
+  `registeredmodels`, using the registered model name for both; `GetLatestVersions` instead
+  requires broad or matching named `list` on `registeredmodels` and does not filter its response
+- trace collection responses are filtered by named `get` on their owning `experiments`
+- MCP server and access-endpoint (binding) collection responses are filtered by named `get` on
+  `mcpservers`, using the server name
+- scorer collections retain their experiment-based policy: a supplied experiment reference
+  requires `get` on that experiment; supported unscoped collections filter by readable experiments
+- configured run, logged-model, dataset, trace, and metric collection requests retain their
+  request-side narrowing by explicit experiment IDs, run IDs, or trace locations
+- GraphQL collections retain their explicit query-driven authorization and filtering
+
+The [versioned endpoint inventory](authorization-collections-v1.md) records the exact mappings,
+including hybrid scorer behavior and workspace-scoped exceptions.
+
+These policies are endpoint-specific. Dataset-input search uses `datasets:list` with
+experiment-based request narrowing. Evaluation-dataset search responses retain a dataset only
+when the caller can read every associated experiment. The existing filter accepts plural
+`experiment_ids`/`experimentIds` and legacy singular `experiment_id`/`experimentId` fields.
+Datasets with missing, malformed, unresolved, or unreadable experiment associations are omitted.
+Broad `datasets:list` continues to bypass response filtering.
+Existing broad-only collections, including gateway listings and webhook listings, continue
+to require broad `list` permission.
+
+For **new resource types** added in v1 compatibility backports, workspace-wide searches and
+listings require broad `list` on the resource in the resolved workspace namespace. The
+authorization review has no `resourceName`, so the Role rule must omit `resourceNames`.
+Named `get` or named `list` alone does not authorize a search, even when the request includes an
+exact name predicate. Without broad `list`, the plugin returns `PERMISSION_DENIED` before
+invoking the MLflow handler.
+
+Direct reads remain separate: broad `get` permits reads, and a matching named `get` permits
+reading that object when the resource supports stable name resolution. Broad `list` does not
+grant `get`, and broad `get` does not grant `list`. Grants apply only within their namespace;
+normal workspace isolation still applies to allowed collections.
+
+For example, these rules allow gateway endpoint listings in `team-a` and direct reads of
+`endpoint-a`. Direct reads of other endpoints require additional `get` permission:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mlflow-gateway-reader
+  namespace: team-a
+rules:
+  - apiGroups: ["mlflow.kubeflow.org"]
+    resources: ["gatewayendpoints"]
+    verbs: ["list"]
+  - apiGroups: ["mlflow.kubeflow.org"]
+    resources: ["gatewayendpoints"]
+    resourceNames: ["endpoint-a"]
+    verbs: ["get"]
+```
+
+New v1 response filters are out of scope. Named-grant collection searches for new resources
+are deferred to v2 request-side scoping, tracked in
+[RHOAIENG-74916](https://redhat.atlassian.net/browse/RHOAIENG-74916).
 
 Use the example manifest below as a starting point for both broad workspace access and name-scoped experiment access:
 

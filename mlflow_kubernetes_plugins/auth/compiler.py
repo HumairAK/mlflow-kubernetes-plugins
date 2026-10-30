@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from functools import lru_cache
+from itertools import chain
 
 from fastapi import FastAPI
+from fastapi import routing as fastapi_routing
 from fastapi.routing import APIRoute
 from mlflow.exceptions import MlflowException
 from mlflow.protos import databricks_pb2
@@ -14,6 +17,7 @@ from mlflow.server import handlers as mlflow_handlers
 from mlflow.server.handlers import get_endpoints
 
 import mlflow_kubernetes_plugins.auth.core as core_mod
+from mlflow_kubernetes_plugins.auth.collection_filters import COLLECTION_POLICY_BROAD_ONLY
 from mlflow_kubernetes_plugins.auth.core import (
     _canonicalize_path,
     _fastapi_path_to_template,
@@ -55,6 +59,8 @@ def _compile_authorization_rules() -> None:
     global _RULES_COMPILED
     if _RULES_COMPILED:
         return
+
+    _validate_broad_only_collection_rules()
 
     # Rebuild every cache/artifact so reconfiguration (e.g., during tests) is deterministic.
     _HANDLER_RULES.clear()
@@ -162,24 +168,56 @@ def _compile_authorization_rules() -> None:
     _RULES_COMPILED = True
 
 
+def _validate_broad_only_collection_rules() -> None:
+    """Reject collection mappings that contradict the v1 broad-list contract."""
+    for key, value in chain(REQUEST_AUTHORIZATION_RULES.items(), PATH_AUTHORIZATION_RULES.items()):
+        for rule in _normalize_rules(value):
+            if rule.collection_policy != COLLECTION_POLICY_BROAD_ONLY:
+                continue
+            if (
+                rule.verb != "list"
+                or not rule.resource
+                or rule.resource_name_parsers
+                or rule.allow_if_resource_reference_missing
+                or rule.fallback_to_collection_policy_on_missing_resource_reference
+            ):
+                raise MlflowException(
+                    f"Broad-only collection rule for {key!r} must require list on an explicit "
+                    "resource, without resource-name parsers or missing-reference fallbacks.",
+                    error_code=databricks_pb2.INTERNAL_ERROR,
+                )
+
+
+def _iter_fastapi_route_methods(fastapi_app: FastAPI) -> Iterator[tuple[str, str]]:
+    """Yield native HTTP routes with effective include-router prefixes applied.
+
+    Newer FastAPI releases retain included routers instead of copying their APIRoutes.
+    Use their route contexts to preserve nested prefixes; older releases expose the
+    already-flattened APIRoutes directly. Flask mounts are validated separately.
+    """
+    routes = getattr(fastapi_app, "routes", [])
+    iter_contexts = getattr(fastapi_routing, "iter_route_contexts", None)
+    for context in iter_contexts(routes) if iter_contexts is not None else routes:
+        original_route = getattr(context, "original_route", context)
+        if not isinstance(original_route, APIRoute):
+            continue
+        for method in context.methods or set():
+            if method not in {"HEAD", "OPTIONS"}:
+                yield context.path, method
+
+
 def _validate_fastapi_route_authorization(fastapi_app: FastAPI) -> None:
     """Ensure all protected FastAPI routes are covered by authorization rules."""
     missing: list[tuple[str, str]] = []
 
-    for route in getattr(fastapi_app, "routes", []):
-        if not isinstance(route, APIRoute):
-            continue
-        methods = getattr(route, "methods", set()) or set()
-        canonical_path = _canonicalize_path(raw_path=route.path or "")
+    for path, method in _iter_fastapi_route_methods(fastapi_app):
+        canonical_path = _canonicalize_path(raw_path=path)
         if not canonical_path or _is_unprotected_path(canonical_path):
             continue
         template_path = _fastapi_path_to_template(canonical_path)
 
-        for method in methods:
-            if method in {"HEAD", "OPTIONS"}:
-                continue
-            if PATH_AUTHORIZATION_RULES.get((template_path, method)) is None:
-                missing.append((method, canonical_path))
+        if PATH_AUTHORIZATION_RULES.get((template_path, method)) is None:
+            missing.append((method, canonical_path))
 
     if missing:
         formatted = ", ".join(f"{method} {path}" for method, path in missing)

@@ -14,6 +14,7 @@ import mlflow_kubernetes_plugins.auth.resource_names as resource_names_mod
 import pytest
 from fastapi.testclient import TestClient
 from flask import Flask, request
+from google.protobuf.json_format import MessageToDict
 from mlflow.exceptions import MlflowException
 from mlflow.protos import databricks_pb2
 from mlflow.protos.model_registry_pb2 import (
@@ -23,6 +24,7 @@ from mlflow.protos.model_registry_pb2 import (
     GetModelVersion,
     GetRegisteredModel,
     RenameRegisteredModel,
+    SearchRegisteredModels,
 )
 from mlflow.protos.service_pb2 import (
     AddDatasetToExperiments,
@@ -51,10 +53,13 @@ from mlflow.protos.service_pb2 import (
     GetPromptOptimizationJob,
     GetWorkspace,
     ListGatewayEndpointBindings,
+    ListGatewayEndpoints,
     ListScorers,
     ListWorkspaces,
     RemoveDatasetFromExperiments,
+    SearchEvaluationDatasets,
     SearchPromptOptimizationJobs,
+    SearchTraces,
     SetDatasetTags,
     SetGatewayEndpointTag,
     StartTraceV3,
@@ -71,6 +76,7 @@ from mlflow_kubernetes_plugins.auth._compat import (
     HAS_MLFLOW_3_14_AUTH_SURFACE,
     HAS_MLFLOW_3_15_AUTH_SURFACE,
     HAS_MLFLOW_3_16_AUTH_SURFACE,
+    HAS_MLFLOW_3_17_AUTH_SURFACE,
     AddGuardrailToEndpoint,
     AddItemsToReviewQueue,
     BatchGetTraceInfos,
@@ -120,6 +126,7 @@ from mlflow_kubernetes_plugins.auth.authorizer import (
     _CacheEntry,
 )
 from mlflow_kubernetes_plugins.auth.collection_filters import (
+    COLLECTION_POLICY_BROAD_ONLY,
     COLLECTION_POLICY_REQUEST_EXPERIMENT_ID,
     COLLECTION_POLICY_REQUEST_EXPERIMENT_IDS,
     COLLECTION_POLICY_REQUEST_RUN_IDS,
@@ -3110,6 +3117,33 @@ def test_compile_rules_raise_for_uncovered_endpoint(monkeypatch):
     assert "/api/2.0/mlflow/uncovered" in str(exc.value)
 
 
+@pytest.mark.parametrize("rule_table", ["request", "path"])
+@pytest.mark.parametrize(
+    "invalid_fields",
+    [
+        {"verb": "get"},
+        {"verb": None},
+        {"resource": None},
+        {"resource_name_parsers": (RESOURCE_NAME_PARSER_GATEWAY_ENDPOINT_SELECTOR_TO_NAME,)},
+        {"allow_if_resource_reference_missing": True},
+        {"fallback_to_collection_policy_on_missing_resource_reference": True},
+    ],
+)
+def test_compile_rejects_broad_only_collection_fallbacks(
+    monkeypatch, compile_auth_rules, rule_table, invalid_fields
+):
+    rule = AuthorizationRule(
+        "list", resource=RESOURCE_GATEWAY_ENDPOINTS, collection_policy=COLLECTION_POLICY_BROAD_ONLY
+    )._replace(**invalid_fields)
+    table = REQUEST_AUTHORIZATION_RULES if rule_table == "request" else PATH_AUTHORIZATION_RULES
+    key = ListGatewayEndpoints if rule_table == "request" else ("/api/3.0/test-collection", "GET")
+    monkeypatch.setitem(table, key, rule)
+
+    with pytest.raises(MlflowException, match="Broad-only collection rule") as exc:
+        compile_auth_rules([])
+    assert exc.value.error_code == "INTERNAL_ERROR"
+
+
 def test_gateway_proxy_routes_require_verbs():
     get_rule = PATH_AUTHORIZATION_RULES[("/api/2.0/mlflow/gateway-proxy", "GET")]
     post_rule = PATH_AUTHORIZATION_RULES[("/ajax-api/2.0/mlflow/gateway-proxy", "POST")]
@@ -3400,10 +3434,14 @@ def test_mlflow_315_request_authorization_rules_cover_new_endpoints():
 
     artifact_path_parsers = (RESOURCE_NAME_PARSER_ARTIFACT_EXPERIMENT_ID_TO_NAME,)
     artifact_get_rule = AuthorizationRule(
-        "get", resource=RESOURCE_EXPERIMENTS, resource_name_parsers=artifact_path_parsers
+        "get",
+        resource=RESOURCE_EXPERIMENTS,
+        resource_name_parsers=artifact_path_parsers,
     )
     artifact_put_rule = AuthorizationRule(
-        "update", resource=RESOURCE_EXPERIMENTS, resource_name_parsers=artifact_path_parsers
+        "update",
+        resource=RESOURCE_EXPERIMENTS,
+        resource_name_parsers=artifact_path_parsers,
     )
     for prefix in (
         "/api/2.0/mlflow-artifacts/artifacts/<path:artifact_path>",
@@ -3420,6 +3458,23 @@ def test_mlflow_316_assistant_tool_result_authorization():
     assert PATH_AUTHORIZATION_RULES[
         ("/ajax-api/3.0/mlflow/assistant/sessions/<session_id>/tool-result", "POST")
     ] == AuthorizationRule("update", resource=RESOURCE_ASSISTANTS)
+
+
+def test_mlflow_317_gateway_authorization():
+    if not HAS_MLFLOW_3_17_AUTH_SURFACE:
+        pytest.skip("Installed MLflow version does not expose the 3.17 gateway routes.")
+
+    assert PATH_AUTHORIZATION_RULES[("/gateway/mlflow/v1/models", "GET")] == AuthorizationRule(
+        "list", resource=RESOURCE_GATEWAY_ENDPOINTS, collection_policy=COLLECTION_POLICY_BROAD_ONLY
+    )
+    assert PATH_AUTHORIZATION_RULES[
+        ("/gateway/typesafe/v1/systemone", "POST")
+    ] == AuthorizationRule(
+        "create",
+        resource=RESOURCE_GATEWAY_ENDPOINTS,
+        subresource="use",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_GATEWAY_PROXY_ENDPOINT_NAME,),
+    )
 
 
 def test_mlflow_prefixed_custom_path_authorization_rules_are_registered():
@@ -4411,6 +4466,214 @@ def test_apply_response_collection_filters_filters_experiments():
     assert filtered == {"experiments": [{"experiment_id": "1", "name": "exp-a"}]}
 
 
+@pytest.mark.parametrize(
+    ("rule_key", "key", "visible", "hidden", "read_resource"),
+    [
+        (
+            SearchRegisteredModels,
+            "registered_models",
+            {"name": "visible"},
+            {"name": "hidden"},
+            RESOURCE_REGISTERED_MODELS,
+        ),
+        (
+            ("/api/2.0/mlflow/model-versions/search", "GET"),
+            "model_versions",
+            {"name": "visible", "version": "1"},
+            {"name": "hidden", "version": "1"},
+            RESOURCE_REGISTERED_MODELS,
+        ),
+        (
+            SearchTraces,
+            "traces",
+            {"info": {"experiment_id": "1"}},
+            {"info": {"experiment_id": "2"}},
+            RESOURCE_EXPERIMENTS,
+        ),
+    ],
+)
+def test_existing_collection_named_get_filtering_is_preserved(
+    monkeypatch, rule_key, key, visible, hidden, read_resource
+):
+    rule = (
+        PATH_AUTHORIZATION_RULES[rule_key]
+        if isinstance(rule_key, tuple)
+        else REQUEST_AUTHORIZATION_RULES[rule_key]
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
+        lambda *args, **kwargs: [rule],
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters._resolve_experiment_name_from_experiment_id",
+        lambda experiment_id: {"1": "visible", "2": "hidden"}[experiment_id],
+    )
+    authorizer = Mock()
+
+    def is_allowed(identity, resource, verb, namespace, subresource=None, resource_name=None):
+        assert namespace == "team-a"
+        return resource == read_resource and verb == "get" and resource_name == "visible"
+
+    authorizer.is_allowed.side_effect = is_allowed
+    result = _authorize_request(
+        AuthorizationRequest(
+            authorization_header="Bearer filter-token",
+            forwarded_access_token=None,
+            remote_user_header_value=None,
+            remote_groups_header_value=None,
+            path="/collection-contract",
+            method="GET",
+            workspace="team-a",
+        ),
+        authorizer=authorizer,
+        config_values=KubernetesAuthConfig(),
+    )
+    assert result.response_filter_required is True
+    filtered, enforceable = apply_response_collection_filters(
+        {key: [visible, hidden]},
+        result.rules,
+        authorizer=authorizer,
+        identity=result.identity,
+        workspace_name="team-a",
+    )
+    assert enforceable is True
+    assert filtered == {key: [visible]}
+
+
+@pytest.mark.parametrize("preserve_proto_field_names", [False, True])
+@pytest.mark.parametrize(
+    ("readable_names", "expected_names"),
+    [
+        ({"exp-a"}, ["visible"]),
+        ({"exp-b"}, ["hidden"]),
+        ({"exp-a", "exp-b"}, ["visible", "shared", "hidden"]),
+        (set(), []),
+    ],
+)
+def test_evaluation_dataset_named_get_filtering_uses_real_response(
+    monkeypatch, preserve_proto_field_names, readable_names, expected_names
+):
+    response = SearchEvaluationDatasets.Response(next_page_token="next-page")
+    response.datasets.add(dataset_id="visible", name="visible", experiment_ids=["1"])
+    response.datasets.add(dataset_id="shared", name="shared", experiment_ids=["1", "2"])
+    response.datasets.add(dataset_id="hidden", name="hidden", experiment_ids=["2"])
+    response.datasets.add(dataset_id="unlinked", name="unlinked")
+    response.datasets.add(dataset_id="unresolved", name="unresolved", experiment_ids=["missing"])
+    payload = MessageToDict(response, preserving_proto_field_name=preserve_proto_field_names)
+
+    def resolve_experiment_name(experiment_id):
+        if experiment_id == "missing":
+            raise ResourceNameResolutionError("Experiment not found.")
+        return {"1": "exp-a", "2": "exp-b"}[experiment_id]
+
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters._resolve_experiment_name_from_experiment_id",
+        resolve_experiment_name,
+    )
+    authorizer = Mock()
+    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
+        args[1:4] == (RESOURCE_EXPERIMENTS, "get", "team-a")
+        and kwargs.get("resource_name") in readable_names
+    )
+    filtered, enforceable = apply_response_collection_filters(
+        payload,
+        [REQUEST_AUTHORIZATION_RULES[SearchEvaluationDatasets]],
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="filter-token"),
+        workspace_name="team-a",
+    )
+    assert enforceable is True
+    assert filtered == {
+        **payload,
+        "datasets": [
+            dataset for dataset in payload["datasets"] if dataset["name"] in expected_names
+        ],
+    }
+    assert len(payload["datasets"]) == 5
+
+
+@pytest.mark.parametrize("payload_key", ["datasets", "dataset_summaries"])
+@pytest.mark.parametrize(
+    "id_key", ["experiment_id", "experimentId", "experiment_ids", "experimentIds"]
+)
+@pytest.mark.parametrize("numeric_ids", [False, True])
+def test_dataset_summary_filter_preserves_response_formats(
+    monkeypatch, payload_key, id_key, numeric_ids
+):
+    visible_id, hidden_id = (1, 2) if numeric_ids else ("1", "2")
+    if id_key in {"experiment_ids", "experimentIds"}:
+        visible_id, hidden_id = [visible_id], [hidden_id]
+    visible = {"name": "visible", id_key: visible_id}
+    hidden = {"name": "hidden", id_key: hidden_id}
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters._resolve_experiment_name_from_experiment_id",
+        lambda experiment_id: {"1": "exp-a", "2": "exp-b"}[experiment_id],
+    )
+    authorizer = Mock()
+    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
+        args[1:4] == (RESOURCE_EXPERIMENTS, "get", "team-a")
+        and kwargs.get("resource_name") == "exp-a"
+    )
+    filtered, enforceable = apply_response_collection_filters(
+        {payload_key: [visible, hidden]},
+        [REQUEST_AUTHORIZATION_RULES[SearchEvaluationDatasets]],
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="filter-token"),
+        workspace_name="team-a",
+    )
+    assert enforceable is True
+    assert filtered == {payload_key: [visible]}
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        None,
+        "invalid",
+        {},
+        {"experiment_ids": []},
+        {"experiment_ids": None},
+        {"experiment_ids": "1"},
+        {"experiment_ids": {"1": True}},
+        {"experiment_ids": [True]},
+        {"experiment_ids": [1.0]},
+        {"experiment_ids": [""]},
+        {"experiment_ids": [" "]},
+        {"experiment_ids": ["1", None]},
+        {"experiment_ids": ["1", "2"]},
+        {"experiment_ids": ["1", "missing"]},
+        {"experiment_ids": ["1"], "experimentId": "2"},
+        {"experiment_ids": ["1"], "experimentIds": ["2"]},
+        {"experiment_ids": [], "experiment_id": "1"},
+        {"experiment_ids": "1", "experiment_id": "1"},
+        {"experiment_id": "1", "experimentId": "2"},
+    ],
+)
+def test_dataset_summary_filter_denies_incomplete_or_unreadable_identity(monkeypatch, summary):
+    def resolve_experiment_name(experiment_id):
+        if experiment_id == "missing":
+            raise ResourceNameResolutionError("Experiment not found.")
+        return {"1": "exp-a", "2": "exp-b"}[experiment_id]
+
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters._resolve_experiment_name_from_experiment_id",
+        resolve_experiment_name,
+    )
+    authorizer = Mock()
+    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
+        kwargs.get("resource_name") == "exp-a"
+    )
+    filtered, enforceable = apply_response_collection_filters(
+        {"datasets": [summary]},
+        [REQUEST_AUTHORIZATION_RULES[SearchEvaluationDatasets]],
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="filter-token"),
+        workspace_name="team-a",
+    )
+    assert enforceable is True
+    assert filtered == {"datasets": []}
+
+
 def test_apply_response_collection_filters_filters_mcp_servers():
     authorizer = Mock()
     authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
@@ -5169,6 +5432,8 @@ def test_gateway_proxy_post_routes_use_endpoint_name_parser():
         routes.append(("/gateway/proxy/<endpoint_name>/<path:path>", "POST"))
     if HAS_MLFLOW_3_14_AUTH_SURFACE:
         routes.append(("/gateway/openai/v1/responses/compact", "POST"))
+    if HAS_MLFLOW_3_17_AUTH_SURFACE:
+        routes.append(("/gateway/typesafe/v1/systemone", "POST"))
 
     for route in routes:
         rule = PATH_AUTHORIZATION_RULES[route]

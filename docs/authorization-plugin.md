@@ -108,6 +108,12 @@ plugin uses the configured namespace instead.
 
 ## Notes
 
+On `release-v1`, compatibility backports preserve existing collection filtering. Workspace-wide
+collections for newly introduced resource types require broad `list` permission; named `get`
+grants still authorize supported direct object reads. A search can therefore return permission
+denied while a direct read succeeds. See [collection permissions in v1](kubernetes-rbac.md#collection-permissions-in-v1)
+for the preserved filtered surfaces and a Role example.
+
 - workspace listings are filtered by the caller's visible namespaces
 - GraphQL and FastAPI routes are covered in addition to the classic Flask endpoints
 - MCP registry FastAPI routes are authorized through the `mcpservers` pseudo-resource, and
@@ -124,3 +130,35 @@ plugin uses the configured namespace instead.
 - startup validation fails if a new protected GraphQL field is added without explicit authorization policy coverage
 
 For the Kubernetes permissions required by the server and callers, see [`kubernetes-rbac.md`](kubernetes-rbac.md).
+
+## Compatibility Backports to v1
+
+See the [preserved endpoint inventory and delivery scope](authorization-collections-v1.md)
+for the versioned baseline, contract-test evidence, and requirements for future backports.
+
+For each supported MLflow release, keep explicit endpoint-to-authorization mappings in the
+version-specific rule tables. Include API/AJAX aliases, methods, FastAPI templates, and GraphQL
+fields where exposed. Startup must continue to fail when a protected endpoint or GraphQL field
+has no explicit policy; never add dynamic authorization fallback for unknown routes.
+
+For a new resource's workspace-wide collection, use `AuthorizationRule("list", resource=...,
+collection_policy=COLLECTION_POLICY_BROAD_ONLY)` with no resource-name parsers. Startup rejects
+broad-only rules that use another verb, omit the resource, or enable named/missing-reference
+fallbacks. At request time, a denied broad check returns `PERMISSION_DENIED` immediately,
+without trying named grants or request/response filtering. Map supported
+direct reads separately to `get` with a validated stable-name parser. Audit resource constants,
+name-scoping allowlists, and workspace permission enumeration together when adding a resource.
+
+Preserve existing filtered collections and hybrid rules such as `ListScorers`. A new endpoint
+on an existing resource needs an individual ownership and scope review. Collections beneath a
+named parent may use that parent's authorization only after verifying the handler cannot
+return children from another parent. Do not classify endpoints solely by names like `List` or
+`Search`.
+
+Add behavioral allow/deny tests and verify startup coverage against the released target MLflow
+version before expanding the dependency range and CI matrix. This delivery adds released
+MLflow 3.17 support while retaining MLflow 3.10–3.16 compatibility. Gateway model discovery
+requires broad `gatewayendpoints:list`; TypeSafe invocations require `create` on
+`gatewayendpoints/use`, scoped to the endpoint selected by `model`.
+New response filters, MLflow 3.18, skills-registry support, and v2 request-side scoping are
+outside the [v1 compatibility ticket](https://redhat.atlassian.net/browse/RHOAIENG-102178).

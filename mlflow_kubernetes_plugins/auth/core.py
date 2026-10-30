@@ -23,6 +23,7 @@ from mlflow_kubernetes_plugins.auth.authorizer import (
     KubernetesAuthorizer,
 )
 from mlflow_kubernetes_plugins.auth.collection_filters import (
+    COLLECTION_POLICY_BROAD_ONLY,
     apply_request_collection_filter,
     is_graphql_collection_policy,
     is_response_filter_policy,
@@ -741,6 +742,13 @@ async def _authorize_request_async(
                 rule.subresource,
             )
             has_broad_permission = has_permission
+            # New-resource collections in v1 require the unnamed list check above.
+            # Never try named grants or collection filtering after that check fails.
+            if not has_permission and rule.collection_policy == COLLECTION_POLICY_BROAD_ONLY:
+                raise MlflowException(
+                    "Permission denied for requested operation.",
+                    error_code=databricks_pb2.PERMISSION_DENIED,
+                )
             response_or_graphql_filter_policy = is_response_filter_policy(
                 rule.collection_policy
             ) or is_graphql_collection_policy(rule.collection_policy)

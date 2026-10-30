@@ -24,6 +24,9 @@ if TYPE_CHECKING:
     from mlflow_kubernetes_plugins.auth.rules import AuthorizationRule
 
 
+# Default for workspace-wide collections of new resource types on release-v1: require an
+# unnamed list review. This marker deliberately enables no request/response filter fallback.
+# Keep existing filtered and parent-scoped collections on their explicit policies.
 COLLECTION_POLICY_BROAD_ONLY = "broad_only"
 COLLECTION_POLICY_GRAPHQL_FILTER = "graphql_filter"
 COLLECTION_POLICY_REQUEST_EXPERIMENT_IDS = "request_filter_experiment_ids"
@@ -483,6 +486,24 @@ def _filter_payload_experiments(
     return True
 
 
+def _dataset_experiment_ids(summary: dict[str, object]) -> list[str]:
+    experiment_ids: list[str] = []
+    for key in ("experiment_ids", "experimentIds", "experiment_id", "experimentId"):
+        if key not in summary:
+            continue
+        value = summary[key]
+        values = value if key in {"experiment_ids", "experimentIds"} else [value]
+        # A malformed plural field must not fall back to a legacy singular ID.
+        if not isinstance(values, list) or not values:
+            return []
+        for item in values:
+            experiment_id = _normalize_string_or_int(item)
+            if experiment_id is None:
+                return []
+            experiment_ids.append(experiment_id)
+    return list(dict.fromkeys(experiment_ids))
+
+
 def _filter_payload_dataset_summaries(
     payload: dict[str, object],
     authorizer: "KubernetesAuthorizer",
@@ -501,12 +522,12 @@ def _filter_payload_dataset_summaries(
         for summary in value:
             if not isinstance(summary, dict):
                 continue
-            experiment_id = _normalize_string(
-                _first_present_value(summary, "experiment_id", "experimentId")
-            )
-            if experiment_id is None:
-                continue
-            if _can_read_experiment_id(authorizer, identity, workspace_name, experiment_id):
+            experiment_ids = _dataset_experiment_ids(summary)
+            # Shared evaluation datasets require read access to every associated experiment.
+            if experiment_ids and all(
+                _can_read_experiment_id(authorizer, identity, workspace_name, experiment_id)
+                for experiment_id in experiment_ids
+            ):
                 filtered_summaries.append(summary)
         payload[payload_key] = filtered_summaries
     return enforced

@@ -8,13 +8,19 @@ from unittest.mock import Mock, patch
 
 import mlflow_kubernetes_plugins.auth.middleware as middleware_mod
 import pytest
-from fastapi import FastAPI
+from fastapi import APIRouter, FastAPI
 from fastapi.middleware.wsgi import WSGIMiddleware
 from fastapi.testclient import TestClient
 from flask import Flask
 from flask import request as flask_request
 from mlflow.exceptions import MlflowException
 from mlflow.protos import databricks_pb2
+from mlflow.protos.service_pb2 import (
+    GetGatewayEndpoint,
+    ListGatewayEndpoints,
+    SearchEvaluationDatasets,
+)
+from mlflow.server.handlers import STATIC_PREFIX_ENV_VAR, get_endpoints
 from mlflow.tracing.utils.otlp import OTLP_TRACES_PATH
 from mlflow.utils import workspace_context
 from mlflow.utils.workspace_utils import WORKSPACE_HEADER_NAME
@@ -25,6 +31,7 @@ from mlflow_kubernetes_plugins.auth.authorizer import (
     KubernetesAuthorizer,
 )
 from mlflow_kubernetes_plugins.auth.collection_filters import (
+    COLLECTION_POLICY_BROAD_ONLY,
     COLLECTION_POLICY_RESPONSE_EXPERIMENTS,
     COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS,
     COLLECTION_POLICY_RESPONSE_MCP_SERVERS,
@@ -34,9 +41,15 @@ from mlflow_kubernetes_plugins.auth.constants import (
     DEFAULT_REMOTE_GROUPS_HEADER,
     DEFAULT_REMOTE_GROUPS_SEPARATOR,
     DEFAULT_REMOTE_USER_HEADER,
+    RESOURCE_DATASETS,
+    RESOURCE_GATEWAY_ENDPOINTS,
     RESOURCE_MCP_SERVERS,
 )
-from mlflow_kubernetes_plugins.auth.core import _AUTHORIZATION_HANDLED
+from mlflow_kubernetes_plugins.auth.core import (
+    _AUTHORIZATION_HANDLED,
+    _canonicalize_path,
+    _RequestIdentity,
+)
 from mlflow_kubernetes_plugins.auth.middleware import KubernetesAuthMiddleware
 from mlflow_kubernetes_plugins.auth.resource_names import (
     RESOURCE_NAME_PARSER_MCP_SERVER_NAME,
@@ -49,6 +62,7 @@ from mlflow_kubernetes_plugins.auth.rules import (
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from werkzeug.routing import Map, Rule
 
 
 @pytest.fixture(autouse=True)
@@ -64,6 +78,278 @@ def test_otel_endpoints_in_auth_rules():
     # Verify they have the correct authorization rule
     rule = PATH_AUTHORIZATION_RULES[(OTLP_TRACES_PATH, "POST")]
     assert (rule.verb, rule.resource) == ("update", "experiments")
+
+
+@pytest.mark.parametrize("mode", list(AuthorizationMode))
+@pytest.mark.parametrize("mounted_flask", [False, True], ids=["fastapi", "flask"])
+@pytest.mark.parametrize(("alias", "static_prefix"), [("/api/", ""), ("/ajax-api/", "/mlflow")])
+@pytest.mark.parametrize(
+    ("grants", "can_list", "can_get_a", "can_get_b"),
+    [
+        pytest.param({("list", None)}, True, False, False, id="broad-list"),
+        pytest.param({("get", "endpoint-a")}, False, True, False, id="named-get"),
+        pytest.param(
+            {("list", None), ("get", "endpoint-a")},
+            True,
+            True,
+            False,
+            id="broad-list-and-named-get",
+        ),
+        pytest.param({("get", None)}, False, True, True, id="broad-get"),
+        pytest.param({("list", "endpoint-a")}, False, False, False, id="named-list"),
+        pytest.param(set(), False, False, False, id="no-grants"),
+    ],
+)
+def test_broad_only_collection_and_named_read_contract(
+    monkeypatch,
+    compile_auth_rules,
+    mode,
+    mounted_flask,
+    alias,
+    static_prefix,
+    grants,
+    can_list,
+    can_get_a,
+    can_get_b,
+):
+    """Exercise the v1 contract using real gateway mappings, not hypothetical skills routes."""
+    monkeypatch.setenv(STATIC_PREFIX_ENV_VAR, static_prefix)
+    # Discover the real API version and methods in the installed supported MLflow release.
+    endpoints = [
+        (_canonicalize_path(raw_path=path), request_class, methods)
+        for path, request_class, methods in get_endpoints(lambda request_class: request_class)
+        if request_class in {ListGatewayEndpoints, GetGatewayEndpoint}
+    ]
+    compile_auth_rules(endpoints)
+    paths = {
+        request_class: path
+        for path, request_class, methods in endpoints
+        if path.startswith(alias) and methods == ["GET"]
+    }
+    assert set(paths) == {ListGatewayEndpoints, GetGatewayEndpoint}
+    list_path = static_prefix + paths[ListGatewayEndpoints]
+    get_path = static_prefix + paths[GetGatewayEndpoint]
+    payload = {"endpoints": [{"name": "endpoint-a"}, {"name": "endpoint-b"}]}
+    handler = Mock(return_value=payload)
+    app = FastAPI()
+    if mounted_flask:
+        flask_app = Flask(__name__)
+        flask_app.add_url_rule(list_path, "list", lambda: handler(), methods=["GET"])
+        flask_app.add_url_rule(get_path, "get", lambda: handler(), methods=["GET"])
+        app.mount("/", WSGIMiddleware(flask_app))
+    else:
+
+        async def endpoint():
+            return handler()
+
+        app.add_api_route(list_path, endpoint, methods=["GET"])
+        app.add_api_route(get_path, endpoint, methods=["GET"])
+
+    authorizer = Mock(spec=KubernetesAuthorizer)
+
+    def is_allowed(identity, resource, verb, namespace, subresource=None, resource_name=None):
+        assert resource == RESOURCE_GATEWAY_ENDPOINTS
+        assert subresource is None
+        assert identity == (
+            _RequestIdentity(token="collection-token")
+            if mode == AuthorizationMode.SELF_SUBJECT_ACCESS_REVIEW
+            else _RequestIdentity(user="alice", groups=("developers",))
+        )
+        return namespace == "team-a" and (verb, resource_name) in grants
+
+    authorizer.is_allowed.side_effect = is_allowed
+    app.add_middleware(
+        KubernetesAuthMiddleware,
+        authorizer=authorizer,
+        config_values=KubernetesAuthConfig(authorization_mode=mode),
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.middleware.resolve_workspace_from_header",
+        lambda header: SimpleNamespace(name=header) if header else None,
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.core._parse_jwt_subject", lambda *args: "alice"
+    )
+    headers = {
+        "Authorization": "Bearer collection-token",
+        DEFAULT_REMOTE_USER_HEADER: "alice",
+        DEFAULT_REMOTE_GROUPS_HEADER: "developers",
+        WORKSPACE_HEADER_NAME: "team-a",
+    }
+    with TestClient(app) as client:
+        # Exercise only fields actually supported by ListGatewayEndpoints.
+        for request_data in (
+            {},
+            {"params": {"provider": "openai"}},
+        ):
+            handler.reset_mock()
+            authorizer.is_allowed.reset_mock()
+            response = client.request("GET", list_path, headers=headers, **request_data)
+            assert response.status_code == (200 if can_list else 403)
+            if can_list:
+                assert response.json() == payload
+            else:
+                assert response.json()["error"]["code"] == "PERMISSION_DENIED"
+            assert handler.call_count == int(can_list)
+            # No named-list or named-get reviews, and no response-filter reviews.
+            authorizer.is_allowed.assert_called_once()
+            review = authorizer.is_allowed.call_args
+            assert review.args[1:] == (RESOURCE_GATEWAY_ENDPOINTS, "list", "team-a", None)
+            assert review.kwargs == {}
+
+        for name, allowed in (("endpoint-a", can_get_a), ("endpoint-b", can_get_b)):
+            handler.reset_mock()
+            response = client.get(get_path, headers=headers, params={"name": name})
+            assert response.status_code == (200 if allowed else 403)
+            assert handler.call_count == int(allowed)
+
+        # A broad or named grant in team-a must never authorize a request in team-b.
+        for path in (list_path, get_path):
+            handler.reset_mock()
+            response = client.get(
+                path,
+                headers={**headers, WORKSPACE_HEADER_NAME: "team-b"},
+                params={"name": "endpoint-a"},
+            )
+            assert response.status_code == 403
+            handler.assert_not_called()
+
+        handler.reset_mock()
+        authorizer.is_allowed.reset_mock()
+        response = client.get(
+            list_path, headers={k: v for k, v in headers.items() if k != WORKSPACE_HEADER_NAME}
+        )
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "INVALID_PARAMETER_VALUE"
+        handler.assert_not_called()
+        authorizer.is_allowed.assert_not_called()
+
+        if ("get", None) not in grants:
+            # Missing names cannot satisfy named get, even when endpoint-a is granted.
+            handler.reset_mock()
+            response = client.get(get_path, headers=headers)
+            assert response.status_code == 403
+            handler.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", list(AuthorizationMode))
+@pytest.mark.parametrize("mounted_flask", [False, True], ids=["fastapi", "flask"])
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize(
+    ("grant", "allowed"),
+    [("broad-list", True), ("named-get", False), ("named-list", False), ("none", False)],
+)
+def test_broad_only_search_contract_with_exact_name_filter(
+    monkeypatch, compile_auth_rules, mode, mounted_flask, method, grant, allowed
+):
+    """A test-only searchable collection supports an exact name in both body and query.
+
+    Shipped gateway listings have no name filter. This fixture verifies the engine contract
+    for future backports, without claiming support for a new MLflow endpoint or resource.
+    """
+    path = "/api/3.0/mlflow/test-only-collection/search"
+    monkeypatch.setitem(
+        PATH_AUTHORIZATION_RULES,
+        (path, method),
+        AuthorizationRule(
+            "list",
+            resource=RESOURCE_GATEWAY_ENDPOINTS,
+            collection_policy=COLLECTION_POLICY_BROAD_ONLY,
+        ),
+    )
+    # A denied broad-only search must not enter the request-filter fallback at all.
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.core.apply_request_collection_filter",
+        Mock(side_effect=AssertionError("Broad-only collections must never try filtering")),
+    )
+    compile_auth_rules([])
+    handler = Mock()
+
+    def search(name):
+        handler(name)
+        return {
+            "items": [
+                item
+                for item in [{"name": "endpoint-a"}, {"name": "endpoint-b"}]
+                if item["name"] == name
+            ]
+        }
+
+    app = FastAPI()
+    if mounted_flask:
+        flask_app = Flask(__name__)
+
+        def endpoint():
+            values = flask_request.args if method == "GET" else flask_request.get_json()
+            return search(values["name"])
+
+        flask_app.add_url_rule(path, "search", endpoint, methods=[method])
+        app.mount("/", WSGIMiddleware(flask_app))
+    else:
+
+        async def endpoint(request: Request):
+            values = request.query_params if method == "GET" else await request.json()
+            return search(values["name"])
+
+        app.add_api_route(path, endpoint, methods=[method])
+
+    authorizer = Mock(spec=KubernetesAuthorizer)
+    grants = {
+        "broad-list": {("list", None)},
+        "named-get": {("get", "endpoint-a")},
+        "named-list": {("list", "endpoint-a")},
+        "none": set(),
+    }[grant]
+
+    def is_allowed(identity, resource, verb, namespace, subresource=None, resource_name=None):
+        return (verb, resource_name) in grants
+
+    authorizer.is_allowed.side_effect = is_allowed
+    app.add_middleware(
+        KubernetesAuthMiddleware,
+        authorizer=authorizer,
+        config_values=KubernetesAuthConfig(authorization_mode=mode),
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.middleware.resolve_workspace_from_header",
+        lambda header: SimpleNamespace(name=header),
+    )
+    headers = {
+        "Authorization": "Bearer search-token",
+        WORKSPACE_HEADER_NAME: "team-a",
+        DEFAULT_REMOTE_USER_HEADER: "alice",
+        DEFAULT_REMOTE_GROUPS_HEADER: "developers",
+    }
+    with TestClient(app) as client:
+        response = client.request(
+            method,
+            path,
+            headers=headers,
+            **(
+                {"params": {"name": "endpoint-a"}}
+                if method == "GET"
+                else {"json": {"name": "endpoint-a"}}
+            ),
+        )
+    assert response.status_code == (200 if allowed else 403)
+    if allowed:
+        assert response.json() == {"items": [{"name": "endpoint-a"}]}
+        handler.assert_called_once_with("endpoint-a")
+    else:
+        assert response.json()["error"]["code"] == "PERMISSION_DENIED"
+        handler.assert_not_called()
+    identity = (
+        _RequestIdentity(token="search-token")
+        if mode == AuthorizationMode.SELF_SUBJECT_ACCESS_REVIEW
+        else _RequestIdentity(user="alice", groups=("developers",))
+    )
+    authorizer.is_allowed.assert_called_once_with(
+        identity,
+        RESOURCE_GATEWAY_ENDPOINTS,
+        "list",
+        "team-a",
+        None,
+    )
 
 
 def test_trace_get_endpoints_in_auth_rules():
@@ -936,6 +1222,101 @@ def test_fastapi_response_collection_filter_applies_to_experiments(
     assert response.json()["experiments"] == [{"experiment_id": "1", "name": "exp-a"}]
 
 
+@pytest.mark.parametrize("mode", list(AuthorizationMode))
+@pytest.mark.parametrize("alias", ["/api/", "/ajax-api/"])
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize(
+    ("grant", "expected_names"),
+    [
+        ("named-get", ["visible"]),
+        ("both-named-get", ["visible", "shared", "hidden"]),
+        ("none", []),
+        ("broad-list", ["visible", "shared", "hidden", "unlinked"]),
+    ],
+)
+def test_evaluation_dataset_filter_with_registered_handler(
+    monkeypatch, compile_auth_rules, mode, alias, method, grant, expected_names
+):
+    from mlflow.server import handlers
+    from mlflow.store.entities import PagedList
+
+    path = next(
+        path
+        for path, request_class, methods in get_endpoints(lambda request_class: request_class)
+        if request_class is SearchEvaluationDatasets
+        and method in methods
+        and _canonicalize_path(raw_path=path).startswith(alias)
+    )
+    compile_auth_rules([(path, SearchEvaluationDatasets, [method])])
+    records = SearchEvaluationDatasets.Response()
+    records.datasets.add(dataset_id="visible", name="visible", experiment_ids=["1"])
+    records.datasets.add(dataset_id="shared", name="shared", experiment_ids=["1", "2"])
+    records.datasets.add(dataset_id="hidden", name="hidden", experiment_ids=["2"])
+    records.datasets.add(dataset_id="unlinked", name="unlinked")
+    store = Mock()
+    store.search_datasets.return_value = PagedList(
+        [SimpleNamespace(to_proto=lambda record=record: record) for record in records.datasets],
+        token="next-page",
+    )
+    monkeypatch.setattr(handlers, "_get_tracking_store", lambda: store)
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters._resolve_experiment_name_from_experiment_id",
+        lambda experiment_id: {"1": "exp-a", "2": "exp-b"}[experiment_id],
+    )
+    authorizer = Mock(spec=KubernetesAuthorizer)
+
+    def is_allowed(identity, resource, verb, namespace, subresource=None, resource_name=None):
+        assert namespace == "team-a"
+        if resource == RESOURCE_DATASETS and verb == "list" and resource_name is None:
+            return grant == "broad-list"
+        return (
+            resource == "experiments"
+            and verb == "get"
+            and (
+                (grant == "named-get" and resource_name == "exp-a")
+                or (grant == "both-named-get" and resource_name in {"exp-a", "exp-b"})
+            )
+        )
+
+    authorizer.is_allowed.side_effect = is_allowed
+    flask_app = Flask(__name__)
+    flask_app.add_url_rule(
+        path,
+        "search_evaluation_datasets",
+        handlers.get_handler(SearchEvaluationDatasets),
+        methods=[method],
+    )
+    app = FastAPI()
+    app.mount("/", WSGIMiddleware(flask_app))
+    app.add_middleware(
+        KubernetesAuthMiddleware,
+        authorizer=authorizer,
+        config_values=KubernetesAuthConfig(authorization_mode=mode),
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.middleware.resolve_workspace_from_header",
+        lambda name: SimpleNamespace(name=name),
+    )
+    headers = {
+        "Authorization": "Bearer dataset-token",
+        DEFAULT_REMOTE_USER_HEADER: "alice",
+        WORKSPACE_HEADER_NAME: "team-a",
+    }
+    with TestClient(app) as client:
+        response = client.request(
+            method, path, headers=headers, **({"json": {}} if method == "POST" else {})
+        )
+    assert response.status_code == 200
+    assert [dataset["name"] for dataset in response.json()["datasets"]] == expected_names
+    assert response.json()["next_page_token"] == "next-page"
+    store.search_datasets.assert_called_once()
+    assert store.search_datasets.call_args.kwargs["experiment_ids"] is None
+    if grant == "broad-list":
+        assert all(
+            call.args[1] == RESOURCE_DATASETS for call in authorizer.is_allowed.call_args_list
+        )
+
+
 def test_fastapi_filters_mounted_flask_workspace_lists(
     mock_authorizer, mock_config, monkeypatch
 ) -> None:
@@ -1267,6 +1648,49 @@ def test_fastapi_route_validation_fails_for_missing_rule():
         _validate_fastapi_route_authorization(app)
 
 
+@pytest.mark.parametrize("static_prefix", ["", "/mlflow"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_fastapi_route_validation_checks_included_routers(monkeypatch, static_prefix, nested):
+    monkeypatch.setenv(STATIC_PREFIX_ENV_VAR, static_prefix)
+    router = APIRouter()
+
+    @router.api_route("/items/{name:path}", methods=["GET", "POST"])
+    async def endpoint():
+        return {}
+
+    app = FastAPI()
+    if nested:
+        parent = APIRouter()
+        parent.include_router(router, prefix="/nested")
+        router = parent
+    prefix = "/api/3.0/mlflow/test-only-router"
+    path = prefix + ("/nested" if nested else "") + "/items/<path:name>"
+    app.include_router(router, prefix=static_prefix + prefix)
+    rule = AuthorizationRule("list", resource=RESOURCE_GATEWAY_ENDPOINTS)
+    monkeypatch.setitem(PATH_AUTHORIZATION_RULES, (path, "GET"), rule)
+
+    # GET coverage must not conceal a missing POST rule, even in a nested router.
+    with pytest.raises(MlflowException, match="POST .*test-only-router"):
+        _validate_fastapi_route_authorization(app)
+    monkeypatch.setitem(PATH_AUTHORIZATION_RULES, (path, "POST"), rule)
+    _validate_fastapi_route_authorization(app)
+
+
+def test_fastapi_route_validation_supports_flattened_routes(monkeypatch):
+    # FastAPI versions without route contexts expose APIRoutes directly.
+    from mlflow_kubernetes_plugins.auth import compiler
+
+    monkeypatch.setattr(compiler.fastapi_routing, "iter_route_contexts", None, raising=False)
+    app = FastAPI()
+
+    @app.get("/api/3.0/mlflow/test-only-flattened")
+    async def endpoint():
+        return {}
+
+    with pytest.raises(MlflowException, match="test-only-flattened"):
+        _validate_fastapi_route_authorization(app)
+
+
 def test_fastapi_route_validation_rejects_unknown_nested_mcp_route():
     app = FastAPI()
 
@@ -1323,7 +1747,8 @@ def test_create_app_wraps_flask_with_fastapi(monkeypatch):
     validate_graphql.assert_called_once_with()
 
 
-def test_create_app_validates_current_mlflow_startup_rules(monkeypatch):
+@pytest.mark.parametrize("uncovered_route", [None, "flask", "fastapi"])
+def test_create_app_validates_current_mlflow_startup_rules(monkeypatch, uncovered_route):
     from mlflow.server import app as real_mlflow_app
     from mlflow.server.handlers import get_endpoints as real_get_endpoints
     from mlflow_kubernetes_plugins.auth.compiler import _reset_compiled_rules
@@ -1331,13 +1756,46 @@ def test_create_app_validates_current_mlflow_startup_rules(monkeypatch):
 
     config_values = Mock(spec=KubernetesAuthConfig)
     authorizer = Mock(spec=KubernetesAuthorizer)
-    original_iter_rules = real_mlflow_app.url_map.iter_rules
+    if uncovered_route == "flask":
+        path = "/api/3.0/mlflow/test-only-uncovered-collection"
+        # Copy the real route map so this negative case cannot leak into another test.
+        monkeypatch.setattr(
+            real_mlflow_app,
+            "url_map",
+            Map(
+                [rule.empty() for rule in Map.iter_rules(real_mlflow_app.url_map)]
+                + [
+                    Rule(path, endpoint="uncovered_collection", methods=["GET"]),
+                ]
+            ),
+        )
+        monkeypatch.setattr(
+            real_mlflow_app,
+            "view_functions",
+            {**real_mlflow_app.view_functions, "uncovered_collection": lambda: {}},
+        )
+    elif uncovered_route == "fastapi":
+        real_create_fastapi_app = middleware_mod.create_fastapi_app
+
+        def create_with_uncovered_router(app):
+            fastapi_app = real_create_fastapi_app(app)
+            router = APIRouter()
+
+            @router.get("/api/3.0/mlflow/test-only-uncovered-collection")
+            async def endpoint():
+                return {}
+
+            fastapi_app.include_router(router)
+            return fastapi_app
+
+        monkeypatch.setattr(middleware_mod, "create_fastapi_app", create_with_uncovered_router)
 
     monkeypatch.delenv("K8S_AUTH_TEST_SKIP_COMPILE", raising=False)
     monkeypatch.setattr("mlflow_kubernetes_plugins.auth.compiler.get_endpoints", real_get_endpoints)
     monkeypatch.setattr(
         "mlflow_kubernetes_plugins.auth.compiler.mlflow_app.url_map.iter_rules",
-        lambda: original_iter_rules(),
+        # The autouse fixture has patched the instance method; bind the real class method.
+        lambda: Map.iter_rules(real_mlflow_app.url_map),
     )
     monkeypatch.setattr(
         "mlflow_kubernetes_plugins.auth.middleware.KubernetesAuthConfig.from_env",
@@ -1353,11 +1811,14 @@ def test_create_app_validates_current_mlflow_startup_rules(monkeypatch):
 
     _reset_compiled_rules()
 
-    # `test_compile_rules_raise_for_uncovered_endpoint` covers the negative compiler path.
-    # This test is the positive integration check that live MLflow startup coverage still passes.
+    assert any("get-artifact" in rule.rule for rule in real_mlflow_app.url_map.iter_rules())
     try:
-        result = create_app(Flask(__name__))
-        assert result is not None
+        if uncovered_route:
+            with pytest.raises(MlflowException, match="test-only-uncovered-collection") as exc:
+                create_app(real_mlflow_app)
+            assert exc.value.error_code == "INTERNAL_ERROR"
+        else:
+            assert create_app(real_mlflow_app) is not None
     finally:
         _reset_compiled_rules()
 
